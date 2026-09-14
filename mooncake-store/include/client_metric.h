@@ -263,23 +263,27 @@ struct MasterClientMetric {
         // Get all available RPC names from the dynamic metrics
         // We'll iterate through all possible RPC names instead of using a fixed
         // list
-        std::vector<std::string> all_rpc_names = {"GetReplicaList",
-                                                  "PutStart",
-                                                  "PutEnd",
-                                                  "PutRevoke",
-                                                  "ExistKey",
-                                                  "Remove",
-                                                  "RemoveAll",
-                                                  "MountSegment",
-                                                  "UnmountSegment",
-                                                  "GetFsdir",
-                                                  "BatchGetReplicaList",
-                                                  "BatchPutStart",
-                                                  "BatchPutEnd",
-                                                  "BatchPutRevoke",
-                                                  "MountLocalDiskSegment",
-                                                  "OffloadObjectHeartbeat",
-                                                  "NotifyOffloadSuccess"};
+        std::vector<std::string> all_rpc_names = {
+            "GetReplicaList",
+            "PutStart",
+            "PutEnd",
+            "PutRevoke",
+            "ExistKey",
+            "Remove",
+            "RemoveAll",
+            "MountSegment",
+            "UnmountSegment",
+            "GetFsdir",
+            "BatchGetReplicaList",
+            "BatchPutStart",
+            "BatchPutEnd",
+            "BatchPutRevoke",
+            "MountLocalDiskSegment",
+            "RegisterDurableDeleteProvider",
+            "ValidateDurableDeleteAssignment",
+            "RemoveDurable",
+            "OffloadObjectHeartbeat",
+            "NotifyOffloadSuccess"};
 
         bool found_any = false;
         for (const auto& rpc_name : all_rpc_names) {

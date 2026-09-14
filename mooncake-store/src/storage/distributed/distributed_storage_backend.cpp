@@ -120,18 +120,13 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    EvictionHandler eviction_handler) {
+    EvictionHandler /* eviction_handler */) {
     if (!UsesObjectStorage()) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    if (eviction_handler) {
-        LOG_FIRST_N(WARNING, 1)
-            << "DistributedStorageBackend does not support eviction, "
-               "eviction_handler ignored";
     }
 
     std::vector<std::string> success_keys;
@@ -181,6 +176,9 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
             return tl::make_unexpected(err);
         }
     }
+    // This backend does not evict persisted objects during upload. The eviction
+    // callback invalidates disk replicas; calling it here would revoke the
+    // durable replicas just registered by complete_handler.
     return static_cast<int64_t>(success_keys.size());
 }
 
@@ -417,8 +415,67 @@ tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
     return object_storage_adapter_->Exists(key);
 }
 
+tl::expected<void, ErrorCode> DistributedStorageBackend::CheckDurableRead(
+    const std::string& key,
+    const DurableObjectStorageNamespace& expected_namespace) {
+    auto scope = GetDurableDeleteNamespace();
+    if (!scope) return tl::make_unexpected(scope.error());
+    if (!scope->IsValid() || *scope != expected_namespace || key.empty() ||
+        key.size() > scope->max_scoped_key_bytes)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto intent = object_storage_adapter_->HasDeletionIntent(key);
+    if (!intent) return tl::make_unexpected(intent.error());
+    if (*intent) return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    return {};
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::DeleteObject(
+    const std::string& key) {
+    if (!UsesObjectStorage() || !initialized_) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    auto intent = object_storage_adapter_->MarkDeletion(key);
+    if (!intent) return intent;
+    return object_storage_adapter_->Delete(key);
+}
+
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsEnableOffloading() {
     return UsesObjectStorage();
+}
+
+tl::expected<DurableObjectStorageNamespace, ErrorCode>
+DistributedStorageBackend::GetDurableDeleteNamespace() const {
+    if (!UsesObjectStorage() || !initialized_) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return object_storage_adapter_->GetDurableDeleteNamespace();
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::DeleteObject(
+    const std::string& key,
+    const DurableObjectStorageNamespace& expected_namespace) {
+    auto actual_namespace = GetDurableDeleteNamespace();
+    if (!actual_namespace) {
+        return tl::make_unexpected(actual_namespace.error());
+    }
+    if (*actual_namespace != expected_namespace ||
+        !actual_namespace->IsValid() || key.empty() ||
+        key.size() > actual_namespace->max_scoped_key_bytes) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return DeleteObject(key);
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::FenceObject(
+    const std::string& key,
+    const DurableObjectStorageNamespace& expected_namespace) {
+    auto scope = GetDurableDeleteNamespace();
+    if (!scope) return tl::make_unexpected(scope.error());
+    if (!scope->IsValid() || *scope != expected_namespace ||
+        scope->protocol_version != kDurableReadFenceProtocolVersion ||
+        key.empty() || key.size() > scope->max_scoped_key_bytes)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return object_storage_adapter_->MarkDeletion(key);
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(

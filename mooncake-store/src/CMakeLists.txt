@@ -2,6 +2,7 @@ add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
+    durable_delete_rpc.cpp
     types.cpp
     utils.cpp
     mmap_arena.cpp
@@ -17,6 +18,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
     master_service.cpp
+    durable_delete_journal.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
@@ -96,6 +98,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     file_storage.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
+    storage/distributed/s3_object_storage_adapter.cpp
     config/client_auto_port_config.cpp
     config/local_hot_cache_config.cpp
     config/offset_allocator_backend_config.cpp
@@ -479,6 +482,13 @@ if(USE_ASCEND
 endif()
 
 # Reduced Store library linked by mooncake_master.
+if(HAVE_AWS_SDK)
+  target_link_libraries(mooncake_store_master_objects
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
+
 add_library(
   mooncake_store_master STATIC $<TARGET_OBJECTS:mooncake_store_shared_objects>
                                $<TARGET_OBJECTS:mooncake_store_master_objects>)
@@ -593,6 +603,13 @@ endif()
 install(TARGETS mooncake_master DESTINATION bin)
 
 # Store Client executable.
+if(BUILD_UNIT_TESTS AND HAVE_AWS_SDK)
+  add_executable(s3_store_smoke ../tests/s3_store_smoke.cpp)
+  target_link_libraries(s3_store_smoke PRIVATE mooncake_store crypto)
+  add_executable(s3_business_client ../tests/s3_business_client.cpp)
+  target_link_libraries(s3_business_client PRIVATE mooncake_store crypto)
+endif()
+
 add_executable(mooncake_client real_client_main.cpp)
 set_target_properties(mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
@@ -680,4 +697,14 @@ if(WITH_STORE_C_SHARED)
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
+  if(BUILD_UNIT_TESTS AND HAVE_AWS_SDK)
+    add_executable(s3_ffi_business_client ../tests/s3_business_client.cpp)
+    target_compile_definitions(s3_ffi_business_client
+                               PRIVATE MOONCAKE_TEST_C_ABI_SHARED)
+    target_link_libraries(
+      s3_ffi_business_client PRIVATE mooncake_store_c crypto
+                                     yalantinglibs::yalantinglibs)
+    target_include_directories(s3_ffi_business_client
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  endif()
 endif()

@@ -6,6 +6,7 @@
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/utils/memory/stl/AWSVector.h>
+#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
 #include <aws/s3/model/ObjectIdentifier.h>
@@ -23,6 +24,7 @@
 #include <atomic>
 #include <vector>
 #include <chrono>
+#include <limits>
 #include <aws/s3/model/CreateMultipartUploadRequest.h>
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
@@ -30,6 +32,7 @@
 #include <aws/s3/model/ChecksumType.h>
 #include <aws/s3/model/UploadPartRequest.h>
 #include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/client/RetryStrategy.h>
 #include "crc32c.h"
 #include "environ.h"
 #include "fmt/format.h"
@@ -66,15 +69,62 @@ std::string EncodeCrc32c(uint32_t checksum) {
     return base64::Encode(bytes);
 }
 
+template <typename Error>
+S3RequestError ClassifyS3Error(const Error &error) {
+    const int status = static_cast<int>(error.GetResponseCode());
+    const std::string exception = error.GetExceptionName();
+    const std::string message = error.GetMessage();
+    std::string searchable = exception + " " + message;
+    std::transform(
+        searchable.begin(), searchable.end(), searchable.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+    S3RequestErrorKind kind = S3RequestErrorKind::kOther;
+    if (status == 401 || status == 403 ||
+        searchable.find("accessdenied") != std::string::npos ||
+        searchable.find("invalidaccesskeyid") != std::string::npos ||
+        searchable.find("signaturedoesnotmatch") != std::string::npos) {
+        kind = S3RequestErrorKind::kPermissionDenied;
+    } else if (exception == "NoSuchBucket") {
+        kind = S3RequestErrorKind::kOther;
+    } else if (exception == "NoSuchKey" || exception == "NotFound" ||
+               (status == 404 && exception.empty())) {
+        kind = S3RequestErrorKind::kNotFound;
+    } else if (status == 408 || status == 504 ||
+               searchable.find("timeout") != std::string::npos ||
+               searchable.find("timed out") != std::string::npos) {
+        kind = S3RequestErrorKind::kTimeout;
+    } else if (status == 0 || status >= 500 || error.ShouldRetry()) {
+        kind = S3RequestErrorKind::kUnavailable;
+    }
+
+    return S3RequestError{
+        .kind = kind,
+        .http_status = status,
+        .message = fmt::format("code={} http_status={} message={}", exception,
+                               status, message),
+    };
+}
+
+S3RequestError InvalidS3Response(std::string message) {
+    return S3RequestError{.kind = S3RequestErrorKind::kInvalidResponse,
+                          .http_status = 0,
+                          .message = std::move(message)};
+}
+
 }  // namespace
 
-bool S3Helper::aws_initialized = false;
+size_t S3Helper::api_refcount_ = 0;
+std::mutex S3Helper::api_mutex_;
 Aws::SDKOptions S3Helper::options_;
 
 void S3Helper::InitAPI() {
+    std::lock_guard lock(api_mutex_);
+    if (api_refcount_++ != 0) {
+        return;
+    }
     options_.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Error;
     Aws::InitAPI(options_);
-    aws_initialized = true;
 
     // Force Environ initialization so all MOONCAKE_AWS_* env vars are read
     // once during startup, matching the previous "read once at InitAPI"
@@ -83,9 +133,9 @@ void S3Helper::InitAPI() {
 }
 
 void S3Helper::ShutdownAPI() {
-    if (aws_initialized) {
+    std::lock_guard lock(api_mutex_);
+    if (api_refcount_ > 0 && --api_refcount_ == 0) {
         Aws::ShutdownAPI(options_);
-        aws_initialized = false;
     }
 }
 
@@ -93,6 +143,11 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
                    const std::string &region) {
     const auto &env = Environ::Get();
     Aws::Client::ClientConfiguration config(true);
+    // The smart-default constructor selects legacy retries explicitly.
+    // Resolve retry settings separately so AWS_RETRY_MODE/MAX_ATTEMPTS apply.
+    config.retryStrategy = Aws::Client::InitRetryStrategy();
+    LOG(INFO) << "S3 retry strategy=" << config.retryStrategy->GetStrategyName()
+              << " max_attempts=" << config.retryStrategy->GetMaxAttempts();
 
     config.connectTimeoutMs = env.GetAwsConnectTimeoutMs();
     config.requestTimeoutMs = env.GetAwsRequestTimeoutMs();
@@ -906,6 +961,280 @@ tl::expected<void, std::string> S3Helper::DeleteObjectsWithPrefix(
 
     // Use existing DeleteObjects method to delete all objects
     return DeleteObjects(object_keys);
+}
+
+tl::expected<void, S3RequestError> S3Helper::UploadBytes(
+    const std::string &key, std::span<const char> data) {
+    return UploadSlices(key, {data});
+}
+
+tl::expected<void, S3RequestError> S3Helper::UploadSlices(
+    const std::string &key, const std::vector<std::span<const char>> &slices) {
+    constexpr size_t part_size = 32UL << 20;
+    size_t total = 0;
+    for (const auto slice : slices) {
+        if (slice.size() > std::numeric_limits<size_t>::max() - total)
+            return tl::make_unexpected(
+                InvalidS3Response("Upload size overflow"));
+        total += slice.size();
+    }
+    if (total > uint64_t(part_size) * 10000)
+        return tl::make_unexpected(
+            InvalidS3Response("Multipart part limit exceeded"));
+
+    // Reuse one bounded staging part for scatter/gather input. The SDK reads
+    // a seekable view, so retries never need another object-sized string copy.
+    std::vector<unsigned char> staging;
+    size_t slice_index = 0, slice_offset = 0;
+    auto next_part = [&](size_t length) -> unsigned char * {
+        while (slice_index < slices.size() &&
+               slice_offset == slices[slice_index].size()) {
+            ++slice_index;
+            slice_offset = 0;
+        }
+        if (length && slice_index < slices.size() &&
+            length <= slices[slice_index].size() - slice_offset) {
+            auto *data = const_cast<unsigned char *>(
+                reinterpret_cast<const unsigned char *>(
+                    slices[slice_index].data() + slice_offset));
+            slice_offset += length;
+            return data;
+        }
+        staging.resize(std::max<size_t>(length, 1));
+        size_t copied = 0;
+        while (copied < length) {
+            if (slice_offset == slices[slice_index].size()) {
+                ++slice_index;
+                slice_offset = 0;
+                continue;
+            }
+            auto n = std::min(length - copied,
+                              slices[slice_index].size() - slice_offset);
+            std::memcpy(staging.data() + copied,
+                        slices[slice_index].data() + slice_offset, n);
+            copied += n;
+            slice_offset += n;
+        }
+        return staging.data();
+    };
+    if (total <= part_size) {
+        Aws::Utils::Stream::PreallocatedStreamBuf buffer(next_part(total),
+                                                         total);
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(bucket_.c_str());
+        request.SetKey(key.c_str());
+        request.SetContentLength(static_cast<long long>(total));
+        request.SetBody(Aws::MakeShared<Aws::IOStream>("StorePut", &buffer));
+        auto outcome = s3_client_.PutObject(request);
+        if (!outcome.IsSuccess())
+            return tl::make_unexpected(ClassifyS3Error(outcome.GetError()));
+        return {};
+    }
+
+    Aws::S3::Model::CreateMultipartUploadRequest create;
+    create.SetBucket(bucket_.c_str());
+    create.SetKey(key.c_str());
+    auto created = s3_client_.CreateMultipartUpload(create);
+    if (!created.IsSuccess())
+        return tl::make_unexpected(ClassifyS3Error(created.GetError()));
+    const auto upload_id = created.GetResult().GetUploadId();
+    struct AbortGuard {
+        Aws::S3::S3Client &client;
+        Aws::S3::Model::AbortMultipartUploadRequest request;
+        bool committed = false;
+        ~AbortGuard() {
+            if (!committed && !client.AbortMultipartUpload(request).IsSuccess())
+                LOG(WARNING)
+                    << "Could not abort this incomplete multipart upload";
+        }
+    } guard{s3_client_, {}};
+    guard.request.SetBucket(bucket_.c_str());
+    guard.request.SetKey(key.c_str());
+    guard.request.SetUploadId(upload_id);
+    Aws::S3::Model::CompletedMultipartUpload completed;
+    int part_number = 1;
+    for (size_t offset = 0; offset < total;
+         offset += part_size, ++part_number) {
+        const auto length = std::min(part_size, total - offset);
+        Aws::Utils::Stream::PreallocatedStreamBuf buffer(next_part(length),
+                                                         length);
+        Aws::S3::Model::UploadPartRequest part;
+        part.SetBucket(bucket_.c_str());
+        part.SetKey(key.c_str());
+        part.SetUploadId(upload_id);
+        part.SetPartNumber(part_number);
+        part.SetContentLength(static_cast<long long>(length));
+        part.SetBody(Aws::MakeShared<Aws::IOStream>("StorePart", &buffer));
+        auto uploaded = s3_client_.UploadPart(part);
+        if (!uploaded.IsSuccess())
+            return tl::make_unexpected(ClassifyS3Error(uploaded.GetError()));
+        Aws::S3::Model::CompletedPart done;
+        done.SetPartNumber(part_number);
+        done.SetETag(uploaded.GetResult().GetETag());
+        completed.AddParts(std::move(done));
+    }
+    Aws::S3::Model::CompleteMultipartUploadRequest finish;
+    finish.SetBucket(bucket_.c_str());
+    finish.SetKey(key.c_str());
+    finish.SetUploadId(upload_id);
+    finish.SetMultipartUpload(std::move(completed));
+    auto finished = s3_client_.CompleteMultipartUpload(finish);
+    if (!finished.IsSuccess())
+        return tl::make_unexpected(ClassifyS3Error(finished.GetError()));
+    guard.committed = true;
+    return {};
+}
+
+tl::expected<size_t, S3RequestError> S3Helper::DownloadBytes(
+    const std::string &key, void *buffer, size_t capacity) {
+    Aws::S3::Model::HeadObjectRequest head;
+    head.SetBucket(bucket_.c_str());
+    head.SetKey(key.c_str());
+    auto info = s3_client_.HeadObject(head);
+    if (!info.IsSuccess())
+        return tl::make_unexpected(ClassifyS3Error(info.GetError()));
+    const auto size = info.GetResult().GetContentLength();
+    if (size < 0 || static_cast<uint64_t>(size) > capacity || (size && !buffer))
+        return tl::make_unexpected(
+            InvalidS3Response("Invalid object size or buffer"));
+    if (!size) return size_t{0};
+    const auto etag = info.GetResult().GetETag();
+    if (etag.empty())
+        return tl::make_unexpected(InvalidS3Response("Missing object ETag"));
+    constexpr size_t part_size = 32UL << 20;
+    std::atomic<size_t> next{0};
+    std::mutex error_mutex;
+    std::optional<S3RequestError> error;
+    auto worker = [&] {
+        for (;;) {
+            {
+                std::lock_guard lock(error_mutex);
+                if (error) return;
+            }
+            const auto offset = next.fetch_add(part_size);
+            if (offset >= static_cast<size_t>(size)) return;
+            const auto length =
+                std::min(part_size, static_cast<size_t>(size) - offset);
+            Aws::Utils::Stream::PreallocatedStreamBuf stream_buffer(
+                static_cast<unsigned char *>(buffer) + offset, length);
+            Aws::S3::Model::GetObjectRequest request;
+            request.SetBucket(bucket_.c_str());
+            request.SetKey(key.c_str());
+            request.SetIfMatch(etag);
+            const auto range = "bytes=" + std::to_string(offset) + "-" +
+                               std::to_string(offset + length - 1);
+            request.SetRange(range.c_str());
+            request.SetResponseStreamFactory([&stream_buffer]() {
+                stream_buffer.pubseekpos(0, std::ios::in | std::ios::out);
+                return Aws::New<Aws::IOStream>("StoreGet", &stream_buffer);
+            });
+            auto outcome = s3_client_.GetObject(request);
+            std::optional<S3RequestError> failure;
+            if (!outcome.IsSuccess()) {
+                failure = ClassifyS3Error(outcome.GetError());
+            } else {
+                auto &result = outcome.GetResult();
+                const auto expected_range =
+                    "bytes " + std::to_string(offset) + "-" +
+                    std::to_string(offset + length - 1) + "/" +
+                    std::to_string(size);
+                if (result.GetContentLength() !=
+                        static_cast<long long>(length) ||
+                    result.GetContentRange() != expected_range.c_str() ||
+                    result.GetBody().tellp() !=
+                        static_cast<std::streamoff>(length))
+                    failure = InvalidS3Response(
+                        "Invalid or truncated ranged response");
+            }
+            if (failure) {
+                std::lock_guard lock(error_mutex);
+                if (!error) error = std::move(failure);
+                return;
+            }
+        }
+    };
+    // A fixed small worker bound avoids object-sized response strings and
+    // bounds connection pressure. If-Match prevents mixed object generations.
+    std::vector<std::jthread> workers;
+    const auto count = std::min<size_t>(4, (size + part_size - 1) / part_size);
+    for (size_t i = 1; i < count; ++i) workers.emplace_back(worker);
+    worker();
+    for (auto &thread : workers) thread.join();
+    if (error) {
+        return tl::make_unexpected(*error);
+    }
+    return static_cast<size_t>(size);
+}
+
+tl::expected<uint64_t, S3RequestError> S3Helper::HeadObjectSize(
+    const std::string &key) {
+    Aws::S3::Model::HeadObjectRequest request;
+    request.SetBucket(bucket_.c_str());
+    request.SetKey(key.c_str());
+    auto outcome = s3_client_.HeadObject(request);
+    if (!outcome.IsSuccess())
+        return tl::make_unexpected(ClassifyS3Error(outcome.GetError()));
+    auto size = outcome.GetResult().GetContentLength();
+    if (size < 0)
+        return tl::make_unexpected(InvalidS3Response("Negative object size"));
+    return static_cast<uint64_t>(size);
+}
+
+tl::expected<bool, S3RequestError> S3Helper::ObjectExists(
+    const std::string &key) {
+    auto result = HeadObjectSize(key);
+    if (result) return true;
+    if (result.error().kind == S3RequestErrorKind::kNotFound) {
+        // HEAD can return the same untyped 404 for a missing bucket and key.
+        Aws::S3::Model::ListObjectsV2Request request;
+        request.SetBucket(bucket_.c_str());
+        request.SetPrefix(key.c_str());
+        request.SetMaxKeys(1);
+        auto probe = s3_client_.ListObjectsV2(request);
+        if (!probe.IsSuccess())
+            return tl::make_unexpected(ClassifyS3Error(probe.GetError()));
+        return false;
+    }
+    return tl::make_unexpected(result.error());
+}
+
+tl::expected<void, S3RequestError> S3Helper::DeleteObjectChecked(
+    const std::string &key) {
+    Aws::S3::Model::DeleteObjectRequest request;
+    request.SetBucket(bucket_.c_str());
+    request.SetKey(key.c_str());
+    auto outcome = s3_client_.DeleteObject(request);
+    if (!outcome.IsSuccess())
+        return tl::make_unexpected(ClassifyS3Error(outcome.GetError()));
+    return {};
+}
+
+tl::expected<std::vector<S3ListedObject>, S3RequestError>
+S3Helper::ListObjectsV2Detailed(const std::string &prefix) {
+    Aws::S3::Model::ListObjectsV2Request request;
+    request.SetBucket(bucket_.c_str());
+    request.SetPrefix(prefix.c_str());
+    std::vector<S3ListedObject> objects;
+    while (true) {
+        auto outcome = s3_client_.ListObjectsV2(request);
+        if (!outcome.IsSuccess())
+            return tl::make_unexpected(ClassifyS3Error(outcome.GetError()));
+        const auto &result = outcome.GetResult();
+        for (const auto &obj : result.GetContents()) {
+            if (obj.GetSize() < 0)
+                return tl::make_unexpected(
+                    InvalidS3Response("Negative listed size"));
+            objects.push_back(
+                {obj.GetKey(), static_cast<uint64_t>(obj.GetSize())});
+        }
+        if (!result.GetIsTruncated()) break;
+        const auto &token = result.GetNextContinuationToken();
+        if (token.empty() || token == request.GetContinuationToken())
+            return tl::make_unexpected(
+                InvalidS3Response("Invalid pagination token"));
+        request.SetContinuationToken(token);
+    }
+    return objects;
 }
 
 }  // namespace mooncake

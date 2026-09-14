@@ -336,6 +336,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys);
 
     int remove(const std::string &key, bool force = false);
+    int remove_durable(const std::string &key);
 
     long removeByRegex(const std::string &str, bool force = false);
 
@@ -955,6 +956,7 @@ class RealClient : public PyClient {
     std::string device_name;
     std::string local_hostname;
     std::string local_rpc_addr;
+    std::unique_ptr<DurableDeleteRpcHandler> durable_delete_rpc_handler_;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;

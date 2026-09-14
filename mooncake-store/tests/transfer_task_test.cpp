@@ -14,6 +14,7 @@
 
 #include "types.h"
 #include "pinned_buffer_pool.h"
+#include "transport/transport.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
@@ -66,6 +67,38 @@ class TransferTaskTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+TEST_F(TransferTaskTest,
+       TransferDeadlineRetainsBuffersUntilPhysicalCompletion) {
+    ScopedEnvVar deadline("MC_STORE_TRANSFER_TIMEOUT_MS", "10");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17939"), 0);
+    if (engine.isUsingTent()) {
+        GTEST_SKIP() << "Legacy batch state test";
+    }
+    const auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    batch.task_list.resize(1);
+    auto& task = batch.task_list[0];
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    task.total_bytes = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 1;
+    std::atomic<bool> buffer_written{false};
+    TransferEngineOperationState state(engine, batch_id, 1);
+    std::thread transfer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        buffer_written.store(true);
+        slice.markSuccess();
+    });
+    state.wait_for_completion();
+    const bool safe_to_release_buffer = buffer_written.load();
+    transfer.join();
+    EXPECT_TRUE(safe_to_release_buffer);
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+}
 
 // Test MemcpyOperationState functionality
 TEST_F(TransferTaskTest, MemcpyOperationState) {

@@ -8,6 +8,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
+#include "storage/distributed/object_storage_namespace.h"
 
 namespace mooncake {
 
@@ -46,6 +47,23 @@ class ObjectStorageAdapter {
 
     virtual tl::expected<void, ErrorCode> Delete(
         const std::string& logical_key) = 0;
+
+    // Optional persistent deletion fence for immutable keys. A backend without
+    // this capability must not report coordinated durable deletion success.
+    virtual tl::expected<void, ErrorCode> MarkDeletion(const std::string&) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual tl::expected<bool, ErrorCode> HasDeletionIntent(
+        const std::string&) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // A generic object adapter or a filesystem replica is not sufficient
+    // evidence of persistent deletion support. Only capable adapters opt in.
+    virtual tl::expected<DurableObjectStorageNamespace, ErrorCode>
+    GetDurableDeleteNamespace() const {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.

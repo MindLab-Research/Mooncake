@@ -798,6 +798,36 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
 // whenever the master answers SEGMENT_NOT_FOUND. These pin the interleavings
 // where the two overlap: the drain must win in every schedule.
 
+TEST_F(FileStorageTest, ShutdownUnregistersDiskRoute) {
+    testing::InProcMaster master;
+    const auto master_root = data_path + "/shutdown_master";
+    fs::create_directories(master_root);
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root)
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+    auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_filepath = data_path + "/shutdown_store";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 1;
+    config.client_buffer_gc_interval_seconds = 1;
+    fs::create_directories(config.storage_filepath);
+    {
+        FileStorage storage(config, client.value(), endpoint);
+        ASSERT_TRUE(storage.Init().has_value());
+    }
+    std::vector<OffloadTaskItem> tasks;
+    auto result = client.value()->OffloadObjectHeartbeat(true, tasks);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 TEST_F(FileStorageTest, HeartbeatAfterDrainDoesNotRemount) {
     std::filesystem::path master_root =
         std::filesystem::path(data_path) / "drain_hb_master";

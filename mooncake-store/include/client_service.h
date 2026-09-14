@@ -302,6 +302,7 @@ class Client {
      * @param force If true, skip lease and replication task checks
      * @return ErrorCode indicating success/failure
      */
+    tl::expected<void, ErrorCode> RemoveDurable(const ObjectKey& key);
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
                                          bool force = false);
 
@@ -470,6 +471,13 @@ class Client {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
+    tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
+        const DurableDeleteCommand& command);
+
+    tl::expected<void, ErrorCode> RegisterDurableDeleteProvider(
+        const DurableObjectStorageNamespace& scope,
+        const std::string& provider_rpc_endpoint);
+
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
     /**

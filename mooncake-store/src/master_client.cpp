@@ -213,6 +213,20 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveDurable> {
+    static constexpr const char* value = "RemoveDurable";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::ValidateDurableDeleteAssignment> {
+    static constexpr const char* value = "ValidateDurableDeleteAssignment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterDurableDeleteProvider> {
+    static constexpr const char* value = "RegisterDurableDeleteProvider";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
     static constexpr const char* value = "MountLocalDiskSegment";
 };
@@ -944,6 +958,25 @@ MasterClient::GetStorageConfig() {
                              GetStorageConfigResponse>();
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RemoveDurable(
+    const std::string& key) {
+    return invoke_rpc<&WrappedMasterService::RemoveDurable, void>(
+        key, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::ValidateDurableDeleteAssignment(
+    const DurableDeleteCommand& command) {
+    return invoke_rpc<&WrappedMasterService::ValidateDurableDeleteAssignment,
+                      void>(command);
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterDurableDeleteProvider(
+    const UUID& client_id, const DurableObjectStorageNamespace& scope,
+    const std::string& provider_rpc_endpoint) {
+    return invoke_rpc<&WrappedMasterService::RegisterDurableDeleteProvider,
+                      void>(client_id, scope, provider_rpc_endpoint);
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(

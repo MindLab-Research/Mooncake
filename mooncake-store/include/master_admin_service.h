@@ -76,8 +76,8 @@ class MasterAdminServer {
                         coro_http::coro_http_response& resp);
     void HandleLeader(coro_http::coro_http_request& req,
                       coro_http::coro_http_response& resp);
-    void HandleQueryKey(coro_http::coro_http_request& req,
-                        coro_http::coro_http_response& resp);
+    async_simple::coro::Lazy<void> HandleQueryKey(
+        coro_http::coro_http_request& req, coro_http::coro_http_response& resp);
     void HandleGetAllKeys(coro_http::coro_http_request& req,
                           coro_http::coro_http_response& resp);
     void HandleGetAllSegments(coro_http::coro_http_request& req,

@@ -826,8 +826,8 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    const int64_t timeout_milliseconds =
+        GetPositiveEnvOrDefault("MC_STORE_TRANSFER_TIMEOUT_MS", 60 * 1000);
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
@@ -861,6 +861,18 @@ void TransferEngineOperationState::wait_for_completion() {
         }
     }  // Explicitly release completion_mutex before acquiring mutex_
 
+    // A wait deadline does not cancel asynchronous writes into caller memory.
+    // Preserve the timeout result, but retain the buffers until every transfer
+    // has physically terminated, as required by Transfer Engine's contract.
+    if (!completed) {
+        LOG(WARNING) << "Transfer deadline exceeded; draining batch "
+                     << batch_id_ << " before releasing caller buffers";
+        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        batch_desc.completion_cv.wait(lock, [&batch_desc] {
+            return batch_desc.is_finished.load(std::memory_order_acquire);
+        });
+    }
+
     // Once completion is observed, read failure flag.
     if (completed) {
         failed = batch_desc.has_failure.load(std::memory_order_relaxed);
@@ -886,18 +898,21 @@ void TransferEngineOperationState::wait_for_completion() {
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
+    bool deadline_exceeded = false;
     while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        if (!deadline_exceeded &&
+            getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
+            deadline_exceeded = true;
+            LOG(WARNING) << "Transfer deadline exceeded; draining batch "
+                         << batch_id_ << " before releasing caller buffers";
         }
 
         std::unique_lock<std::mutex> lock(mutex_);
         check_task_status();
         if (result_.has_value()) {
+            if (deadline_exceeded) {
+                result_ = ErrorCode::TRANSFER_FAIL;
+            }
             VLOG(1) << "Transfer engine operation completed for batch "
                     << batch_id_
                     << " with result: " << static_cast<int>(result_.value());
@@ -906,6 +921,10 @@ void TransferEngineOperationState::wait_for_completion() {
         // Continue polling
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
+        if (deadline_exceeded) {
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 #endif
 }

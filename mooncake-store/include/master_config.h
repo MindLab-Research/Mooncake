@@ -95,6 +95,7 @@ struct MasterConfig {
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
+    std::string durable_delete_journal_path;
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
     uint64_t snapshot_child_timeout_seconds;
@@ -229,6 +230,7 @@ class MasterServiceSupervisorConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    std::string durable_delete_journal_path;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -388,6 +390,7 @@ class MasterServiceSupervisorConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        durable_delete_journal_path = config.durable_delete_journal_path;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -543,6 +546,7 @@ class WrappedMasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    std::string durable_delete_journal_path;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -668,6 +672,7 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        durable_delete_journal_path = config.durable_delete_journal_path;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -764,6 +769,7 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot = config.enable_snapshot;
         enable_snapshot_restore = config.enable_snapshot_restore;
+        durable_delete_journal_path = config.durable_delete_journal_path;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -832,6 +838,7 @@ class MasterServiceConfigBuilder {
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
     bool enable_snapshot_ = false;
+    std::string durable_delete_journal_path_;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
@@ -1025,6 +1032,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
         enable_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_durable_delete_journal_path(
+        const std::string& path) {
+        durable_delete_journal_path_ = path;
         return *this;
     }
 
@@ -1222,6 +1235,7 @@ class MasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    std::string durable_delete_journal_path;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -1314,6 +1328,7 @@ class MasterServiceConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        durable_delete_journal_path = config.durable_delete_journal_path;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -1381,6 +1396,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
     config.enable_snapshot = enable_snapshot_;
+    config.durable_delete_journal_path = durable_delete_journal_path_;
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;

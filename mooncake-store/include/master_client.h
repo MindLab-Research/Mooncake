@@ -13,6 +13,8 @@
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
+#include "durable_delete_rpc.h"
+#include "storage/distributed/object_storage_namespace.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -417,6 +419,15 @@ class MasterClient {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
+    tl::expected<void, ErrorCode> RemoveDurable(const std::string& key);
+
+    tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
+        const DurableDeleteCommand& command);
+
+    tl::expected<void, ErrorCode> RegisterDurableDeleteProvider(
+        const UUID& client_id, const DurableObjectStorageNamespace& scope,
+        const std::string& provider_rpc_endpoint);
+
     [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
         const UUID& client_id, bool enable_offloading);
 

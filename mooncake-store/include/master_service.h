@@ -1,5 +1,9 @@
 #pragma once
 
+#include "durable_delete_journal.h"
+#include "durable_delete_rpc.h"
+#include "storage/distributed/object_storage_namespace.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -165,6 +169,7 @@ class MasterService {
     friend class test::LocalDiskUnmountInterleavingTest;
     // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
     friend class test::MasterServiceSSDTest;
+    friend class WrappedMasterService;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -763,6 +768,18 @@ class MasterService {
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
+    // Namespace advertisement over the same trusted provider control plane as
+    // LOCAL_DISK mounting. This grants no public delete/finish capability.
+    tl::expected<void, ErrorCode> RegisterDurableDeleteProvider(
+        const UUID& client_id, const DurableObjectStorageNamespace& scope,
+        const std::string& provider_rpc_endpoint);
+
+    tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
+        const DurableDeleteCommand& command);
+    tl::expected<std::vector<DurableReadCommand>, ErrorCode> PrepareDurableRead(
+        const std::string& key, const TenantId& tenant_id);
+    uint64_t BoundDurableReadLease(uint64_t ttl_ms) const;
+
     auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
         -> tl::expected<void, ErrorCode>;
 
@@ -985,6 +1002,26 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
+    std::unique_ptr<DurableDeleteJournal> durable_delete_journal_;
+    void RecoverDurableDeletions();
+    tl::expected<DurableDeletePlan, ErrorCode> PrepareDurableDelete(
+        const std::string& key, const TenantId& tenant);
+    // Registry is volatile: providers must re-register after Master restart.
+    // Lock order: snapshot -> metadata shard (if any) -> provider registry.
+    std::mutex durable_provider_mutex_;
+    std::map<UUID, DurableObjectStorageNamespace> durable_providers_;
+    std::map<UUID, std::string> durable_provider_endpoints_;
+
+    // Internal coordinator stages. Do not expose through RPC until durable
+    // recovery and authenticated provider confirmation are wired in. In HA
+    // mode admission refuses to create an unlogged deletion fence.
+    tl::expected<UUID, ErrorCode> BeginDurableDelete(const std::string& key,
+                                                     const TenantId& tenant_id);
+    tl::expected<void, ErrorCode> FinishDurableDelete(
+        const std::string& key, const TenantId& tenant_id,
+        const UUID& operation_id, ErrorCode provider_result,
+        const DurableDeletePlan* plan = nullptr);
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 
@@ -1140,6 +1177,9 @@ class MasterService {
         const bool hard_pinned{false};  // immutable, set at creation
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
+        // Guarded by the metadata shard, like replicas_. Readers must not
+        // grant new leases once the deletion coordinator has fenced the key.
+        bool durable_delete_pending{false};
         TenantQuotaLedger quota_ledger;
 
         struct DynamicReplicaRecord {
@@ -1365,6 +1405,16 @@ class MasterService {
             return lease_->IsExpired(std::chrono::system_clock::now());
         }
 
+        uint64_t RemainingReadLeaseMs() const {
+            SpinLocker locker(&lock);
+            const auto remaining =
+                lease_->ExpiresAt() - std::chrono::system_clock::now();
+            return remaining <= decltype(remaining)::zero()
+                       ? 0
+                       : std::chrono::ceil<std::chrono::milliseconds>(remaining)
+                             .count();
+        }
+
         bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
             SpinLocker locker(&lock);
             return lease_->IsExpired(now);
@@ -1372,6 +1422,9 @@ class MasterService {
 
         // Lease deadline for the eviction census.
         std::chrono::system_clock::time_point EvictionDeadline() const {
+            if (durable_delete_pending) {
+                return std::chrono::system_clock::time_point::max();
+            }
             return lease_->ExpiresAt();
         }
 
@@ -1676,6 +1729,19 @@ class MasterService {
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     struct TenantState {
+        struct DurableDeleteState {
+            UUID operation_id;
+            bool completed{false};
+            std::string namespace_identity;
+            std::map<UUID, UUID> assignments{};
+            // Canonical journal restores these; snapshots need not serialize
+            // a monotonic-clock deadline or infer grace from missing metadata.
+            std::optional<uint64_t> reader_grace_ms;
+            std::chrono::steady_clock::time_point recovery_not_before{};
+        };
+        // Retained after metadata removal: absence is not deletion success,
+        // and immutable keys must not be re-created by a delayed scan/write.
+        std::unordered_map<std::string, DurableDeleteState> durable_deletions;
         TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
@@ -1693,9 +1759,10 @@ class MasterService {
             dynamic_replication_cooldowns;
 
         bool Empty() const {
-            return metadata.empty() && processing_keys.empty() &&
-                   replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && promotion_candidates.empty() &&
+            return durable_deletions.empty() && metadata.empty() &&
+                   processing_keys.empty() && replication_tasks.empty() &&
+                   offloading_tasks.empty() && promotion_tasks.empty() &&
+                   promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
                    dynamic_replication_cooldowns.empty();
@@ -2299,7 +2366,8 @@ class MasterService {
             // ClientMonitorFunc.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
                 tenant_state_ != nullptr &&
-                it_ != tenant_state_->metadata.end()) {
+                it_ != tenant_state_->metadata.end() &&
+                !it_->second.durable_delete_pending) {
                 // Gate the snapshot on the publisher being live: this runs on
                 // every read-write metadata access, and the VisitReplicas walk
                 // plus vector allocation is pure overhead when KV events are
@@ -2361,6 +2429,12 @@ class MasterService {
             return tenant_state_ != nullptr &&
                    it_ != tenant_state_->metadata.end() &&
                    it_->second.IsValid();
+        }
+
+        bool IsDurableDeleteFenced() const NO_THREAD_SAFETY_ANALYSIS {
+            return tenant_state_ != nullptr &&
+                   tenant_state_->durable_deletions.contains(
+                       object_id_.user_key);
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {

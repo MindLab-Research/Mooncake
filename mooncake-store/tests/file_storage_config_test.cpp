@@ -56,6 +56,8 @@ struct FileStorageEnvironment {
     ScopedEnvVar total_size_limit{"MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"};
     ScopedEnvVar heartbeat_interval{
         "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS"};
+    ScopedEnvVar s3_metadata_refresh_interval{
+        "MOONCAKE_OFFLOAD_S3_METADATA_REFRESH_INTERVAL_SECONDS"};
     ScopedEnvVar client_buffer_gc_interval{
         "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS"};
     ScopedEnvVar client_buffer_gc_ttl{
@@ -83,6 +85,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(config.s3_metadata_refresh_interval_seconds, 0u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
     EXPECT_FALSE(config.use_uring);
@@ -359,6 +362,19 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     config.disk_eviction_low_watermark_ratio = 0.8;
     config.disk_eviction_high_watermark_ratio = 1.1;
     EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, PeriodicMetadataDiscoveryRequiresS3) {
+    env.storage_backend_descriptor.Set("s3_object_storage_backend");
+    env.s3_metadata_refresh_interval.Set("3");
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.s3_metadata_refresh_interval_seconds, 3u);
+    EXPECT_TRUE(config.Validate());
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_filepath = data_path.string();
+    EXPECT_FALSE(config.Validate());
+    config.s3_metadata_refresh_interval_seconds = 0;
+    EXPECT_TRUE(config.Validate());
 }
 
 }  // namespace

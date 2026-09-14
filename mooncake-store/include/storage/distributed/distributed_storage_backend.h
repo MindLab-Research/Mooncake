@@ -83,6 +83,21 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
+    // Delete the durable object before Master metadata is removed.
+    tl::expected<void, ErrorCode> DeleteObject(const std::string& key);
+    tl::expected<void, ErrorCode> FenceObject(
+        const std::string& key,
+        const DurableObjectStorageNamespace& expected_namespace);
+    tl::expected<void, ErrorCode> CheckDurableRead(
+        const std::string& key,
+        const DurableObjectStorageNamespace& expected_namespace);
+
+    tl::expected<DurableObjectStorageNamespace, ErrorCode>
+    GetDurableDeleteNamespace() const;
+    tl::expected<void, ErrorCode> DeleteObject(
+        const std::string& key,
+        const DurableObjectStorageNamespace& expected_namespace);
+
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
     tl::expected<void, ErrorCode> ScanMeta(

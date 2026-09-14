@@ -618,42 +618,43 @@ void MasterAdminServer::HandleKvEventsStatus(
         });
 }
 
-void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
-                                       coro_http::coro_http_response& resp) {
-    WithActiveService(resp, [&](auto service) {
-        auto key = req.get_query_value("key");
-        auto get_result = service->GetReplicaList(std::string(key), "default");
-        resp.add_header("Content-Type", "application/json; charset=utf-8");
-        if (get_result) {
-            std::string ss = "{\"success\":true,\"data\":[";
-            const auto& replicas = get_result.value().replicas;
-            bool first = true;
-            for (const auto& replica : replicas) {
-                if (!replica.is_memory_replica()) {
-                    continue;
-                }
-                std::string tmp;
-                struct_json::to_json(
-                    replica.get_memory_descriptor().buffer_descriptor, tmp);
-                if (!first) {
-                    ss += ",";
-                }
-                ss += tmp;
-                first = false;
+async_simple::coro::Lazy<void> MasterAdminServer::HandleQueryKey(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    std::shared_ptr<WrappedMasterService> service;
+    WithActiveService(resp, [&](auto active) { service = std::move(active); });
+    if (!service) co_return;
+    auto key = req.get_query_value("key");
+    auto get_result =
+        co_await service->GetReplicaList(std::string(key), "default");
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    if (get_result) {
+        std::string ss = "{\"success\":true,\"data\":[";
+        const auto& replicas = get_result.value().replicas;
+        bool first = true;
+        for (const auto& replica : replicas) {
+            if (!replica.is_memory_replica()) {
+                continue;
             }
-            ss += "]}";
-            resp.set_status_and_content(coro_http::status_type::ok,
-                                        std::move(ss));
-            return;
+            std::string tmp;
+            struct_json::to_json(
+                replica.get_memory_descriptor().buffer_descriptor, tmp);
+            if (!first) {
+                ss += ",";
+            }
+            ss += tmp;
+            first = false;
         }
+        ss += "]}";
+        resp.set_status_and_content(coro_http::status_type::ok, std::move(ss));
+        co_return;
+    }
 
-        resp.set_status_and_content(
-            coro_http::status_type::not_found,
-            std::string("{\"success\":false,\"error_code\":") +
-                std::to_string(toInt(get_result.error())) +
-                ",\"error_message\":\"" +
-                EscapeJson(toString(get_result.error())) + "\"}");
-    });
+    resp.set_status_and_content(
+        coro_http::status_type::not_found,
+        std::string("{\"success\":false,\"error_code\":") +
+            std::to_string(toInt(get_result.error())) +
+            ",\"error_message\":\"" + EscapeJson(toString(get_result.error())) +
+            "\"}");
 }
 
 void MasterAdminServer::HandleGetAllKeys(coro_http::coro_http_request&,
@@ -1256,7 +1257,7 @@ void MasterAdminServer::RegisterHandler() {
         });
     http_server_.set_http_handler<GET>(
         "/query_key", [this](coro_http_request& req, coro_http_response& resp) {
-            HandleQueryKey(req, resp);
+            return HandleQueryKey(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/get_all_keys",

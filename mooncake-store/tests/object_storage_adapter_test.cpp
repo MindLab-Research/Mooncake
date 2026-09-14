@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,6 +31,35 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
     int putv_calls = 0;
     int get_calls = 0;
     bool initialized = false;
+    ErrorCode intent_error = ErrorCode::NOT_SUPPORTED;
+    ErrorCode read_intent_error = ErrorCode::NOT_SUPPORTED;
+    ErrorCode delete_error = ErrorCode::OK;
+    int delete_calls = 0;
+    std::unordered_set<std::string> intents;
+    std::optional<DurableObjectStorageNamespace> durable_namespace;
+
+    tl::expected<DurableObjectStorageNamespace, ErrorCode>
+    GetDurableDeleteNamespace() const override {
+        if (!durable_namespace) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        return *durable_namespace;
+    }
+
+    tl::expected<bool, ErrorCode> HasDeletionIntent(
+        const std::string& key) override {
+        if (read_intent_error != ErrorCode::OK)
+            return tl::make_unexpected(read_intent_error);
+        return intents.contains(key);
+    }
+
+    tl::expected<void, ErrorCode> MarkDeletion(
+        const std::string& key) override {
+        if (intent_error != ErrorCode::OK)
+            return tl::make_unexpected(intent_error);
+        intents.insert(key);
+        return {};
+    }
 
     tl::expected<void, ErrorCode> Put(const std::string& logical_key,
                                       std::span<const char> data) override {
@@ -75,6 +105,9 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
 
     tl::expected<void, ErrorCode> Delete(
         const std::string& logical_key) override {
+        ++delete_calls;
+        if (delete_error != ErrorCode::OK)
+            return tl::make_unexpected(delete_error);
         objects.erase(logical_key);
         return {};
     }
@@ -180,6 +213,143 @@ class ObjectStorageAdapterTest : public ::testing::Test {
 
     std::filesystem::path root_dir_;
 };
+
+TEST_F(ObjectStorageAdapterTest,
+       ReadFenceValidatesScopeAndPropagatesUncertainty) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+    const DurableObjectStorageNamespace scope{2,
+                                              "s3",
+                                              "https://storage.example.test",
+                                              "isolated-test",
+                                              "test-region",
+                                              "private-prefix",
+                                              128};
+    auto unsupported = backend->CheckDurableRead("key", scope);
+    ASSERT_FALSE(unsupported);
+    EXPECT_EQ(unsupported.error(), ErrorCode::NOT_SUPPORTED);
+    adapter->durable_namespace = scope;
+    auto wrong = scope;
+    wrong.bucket = "wrong-bucket";
+    EXPECT_EQ(backend->CheckDurableRead("key", wrong).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(backend->CheckDurableRead("", scope).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(backend->CheckDurableRead(std::string(129, 'x'), scope).error(),
+              ErrorCode::INVALID_PARAMS);
+    for (const auto error :
+         {ErrorCode::NOT_SUPPORTED, ErrorCode::DFS_PERMISSION_DENIED,
+          ErrorCode::DFS_SERVICE_UNAVAILABLE}) {
+        adapter->read_intent_error = error;
+        EXPECT_EQ(backend->CheckDurableRead("key", scope).error(), error);
+    }
+    adapter->read_intent_error = ErrorCode::OK;
+    EXPECT_TRUE(backend->CheckDurableRead("key", scope));
+    adapter->intents.insert("key");
+    EXPECT_EQ(backend->CheckDurableRead("key", scope).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(backend->CheckDurableRead("independent", scope));
+    EXPECT_EQ(adapter->get_calls, 0);
+    EXPECT_EQ(adapter->delete_calls, 0);
+}
+
+TEST_F(ObjectStorageAdapterTest,
+       DeleteRequiresPersistentIntentAndRetainsFailedWork) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+    const std::string key("tenant\0key", 10);
+    adapter->objects[key] = "bytes";
+    auto unsupported = backend->DeleteObject(key);
+    ASSERT_FALSE(unsupported);
+    EXPECT_EQ(unsupported.error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(adapter->delete_calls, 0);
+    EXPECT_TRUE(adapter->objects.contains(key));
+    adapter->intent_error = ErrorCode::DFS_PERMISSION_DENIED;
+    ASSERT_FALSE(backend->DeleteObject(key));
+    EXPECT_EQ(adapter->delete_calls, 0);
+    adapter->intent_error = ErrorCode::OK;
+    adapter->delete_error = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+    auto failed = backend->DeleteObject(key);
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(adapter->intents.contains(key));
+    EXPECT_TRUE(adapter->objects.contains(key));
+    adapter->delete_error = ErrorCode::OK;
+    ASSERT_TRUE(backend->DeleteObject(key));
+    ASSERT_TRUE(backend->DeleteObject(key));
+    EXPECT_TRUE(adapter->intents.contains(key));
+    EXPECT_FALSE(adapter->objects.contains(key));
+}
+
+TEST_F(ObjectStorageAdapterTest,
+       DurableDeleteRejectsWrongNamespaceBeforeIntent) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    const DurableObjectStorageNamespace expected{
+        .protocol_version = 1,
+        .backend = "s3",
+        .endpoint = "https://storage.example.test",
+        .bucket = "isolated-test",
+        .region = "test-region",
+        .key_prefix = "private-prefix",
+        .max_scoped_key_bytes = 128};
+    adapter->durable_namespace = expected;
+    EXPECT_FALSE(backend->GetDurableDeleteNamespace());
+    ASSERT_TRUE(backend->Init());
+    adapter->intent_error = ErrorCode::OK;
+    const std::string key("tenant\0key", 10);
+    adapter->objects[key] = "original";
+    for (int field = 0; field < 3; ++field) {
+        auto wrong = expected;
+        if (field == 0) wrong.bucket = "different-bucket";
+        if (field == 1) wrong.key_prefix += "/different";
+        if (field == 2) wrong.endpoint = "https://another.example.test";
+        auto result = backend->DeleteObject(key, wrong);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    EXPECT_FALSE(backend->DeleteObject(std::string(129, 'x'), expected));
+    EXPECT_EQ(adapter->delete_calls, 0);
+    EXPECT_TRUE(adapter->intents.empty());
+    EXPECT_EQ(adapter->objects.at(key), "original");
+    EXPECT_TRUE(backend->DeleteObject(key, expected));
+    EXPECT_TRUE(adapter->intents.contains(key));
+    EXPECT_FALSE(adapter->objects.contains(key));
+}
+
+TEST_F(ObjectStorageAdapterTest, ObjectModeAloneCannotAuthorizeDurableDelete) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+    adapter->intent_error = ErrorCode::OK;
+    auto result = backend->DeleteObject("key", DurableObjectStorageNamespace{});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(adapter->delete_calls, 0);
+    EXPECT_TRUE(adapter->intents.empty());
+}
+
+TEST_F(ObjectStorageAdapterTest, WriterAdmissionProtocolMustMatchAndBeValid) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+    adapter->intent_error = ErrorCode::OK;
+    DurableObjectStorageNamespace scope{
+        2,        "s3", "https://storage.example.test", "bucket", "region",
+        "prefix", 128};
+    adapter->durable_namespace = scope;
+    auto legacy = scope;
+    legacy.protocol_version = 1;
+    EXPECT_FALSE(backend->DeleteObject("key", legacy));
+    EXPECT_EQ(adapter->delete_calls, 0);
+    EXPECT_TRUE(backend->DeleteObject("key", scope));
+    scope.protocol_version = 4;
+    adapter->durable_namespace = scope;
+    EXPECT_FALSE(backend->DeleteObject("key", scope));
+    EXPECT_EQ(adapter->delete_calls, 1);
+}
 
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     FakeObjectStorageAdapter* adapter = nullptr;

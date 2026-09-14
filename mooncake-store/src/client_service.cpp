@@ -3490,15 +3490,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
+tl::expected<void, ErrorCode> Client::RemoveDurable(const ObjectKey& key) {
+    if (hot_cache_) hot_cache_->BumpKeyGeneration(key);
+    auto result = master_client_.RemoveDurable(key);
+    if (!result) return tl::unexpected(result.error());
+    if (hot_cache_) hot_cache_->RemoveHotKey(key);
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
     auto result = master_client_.Remove(key, force);
-    // if (storage_backend_) {
-    //     storage_backend_->RemoveFile(key);
-    // }
+    // Remove remains a metadata operation. Durable deletion must coordinate
+    // provider writes and read leases before removing the backing object.
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -3899,6 +3906,18 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
+
+tl::expected<void, ErrorCode> Client::ValidateDurableDeleteAssignment(
+    const DurableDeleteCommand& command) {
+    return master_client_.ValidateDurableDeleteAssignment(command);
+}
+
+tl::expected<void, ErrorCode> Client::RegisterDurableDeleteProvider(
+    const DurableObjectStorageNamespace& scope,
+    const std::string& provider_rpc_endpoint) {
+    return master_client_.RegisterDurableDeleteProvider(client_id_, scope,
+                                                        provider_rpc_endpoint);
+}
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     bool enable_offloading) {

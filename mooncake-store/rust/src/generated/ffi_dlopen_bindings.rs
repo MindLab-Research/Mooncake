@@ -51,6 +51,17 @@ pub struct MooncakeStoreLib {
         device_name: *const ::std::os::raw::c_char,
         mount_segment_size: u64,
     ) -> ::std::os::raw::c_int,
+    pub mooncake_store_setup_with_offload: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        local_hostname: *const ::std::os::raw::c_char,
+        metadata_server: *const ::std::os::raw::c_char,
+        global_segment_size: u64,
+        local_buffer_size: u64,
+        protocol: *const ::std::os::raw::c_char,
+        device_name: *const ::std::os::raw::c_char,
+        master_server_addr: *const ::std::os::raw::c_char,
+        offload_path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int,
     pub mooncake_store_health_check:
         unsafe extern "C" fn(store: mooncake_store_t) -> ::std::os::raw::c_int,
     pub mooncake_store_put: unsafe extern "C" fn(
@@ -94,6 +105,10 @@ pub struct MooncakeStoreLib {
         store: mooncake_store_t,
         key: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int,
+    pub mooncake_store_get_replica_status: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int,
     pub mooncake_store_batch_is_exist: unsafe extern "C" fn(
         store: mooncake_store_t,
         keys: *mut *const ::std::os::raw::c_char,
@@ -111,6 +126,10 @@ pub struct MooncakeStoreLib {
         store: mooncake_store_t,
         key: *const ::std::os::raw::c_char,
         force: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int,
+    pub mooncake_store_remove_durable: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int,
     pub mooncake_store_remove_by_regex: unsafe extern "C" fn(
         store: mooncake_store_t,
@@ -148,6 +167,9 @@ impl MooncakeStoreLib {
         let mooncake_store_init_all = __library
             .get(b"mooncake_store_init_all\0")
             .map(|sym| *sym)?;
+        let mooncake_store_setup_with_offload = __library
+            .get(b"mooncake_store_setup_with_offload\0")
+            .map(|sym| *sym)?;
         let mooncake_store_health_check = __library
             .get(b"mooncake_store_health_check\0")
             .map(|sym| *sym)?;
@@ -167,6 +189,9 @@ impl MooncakeStoreLib {
         let mooncake_store_is_exist = __library
             .get(b"mooncake_store_is_exist\0")
             .map(|sym| *sym)?;
+        let mooncake_store_get_replica_status = __library
+            .get(b"mooncake_store_get_replica_status\0")
+            .map(|sym| *sym)?;
         let mooncake_store_batch_is_exist = __library
             .get(b"mooncake_store_batch_is_exist\0")
             .map(|sym| *sym)?;
@@ -177,6 +202,9 @@ impl MooncakeStoreLib {
             .get(b"mooncake_store_get_hostname\0")
             .map(|sym| *sym)?;
         let mooncake_store_remove = __library.get(b"mooncake_store_remove\0").map(|sym| *sym)?;
+        let mooncake_store_remove_durable = __library
+            .get(b"mooncake_store_remove_durable\0")
+            .map(|sym| *sym)?;
         let mooncake_store_remove_by_regex = __library
             .get(b"mooncake_store_remove_by_regex\0")
             .map(|sym| *sym)?;
@@ -195,6 +223,7 @@ impl MooncakeStoreLib {
             mooncake_store_destroy,
             mooncake_store_setup,
             mooncake_store_init_all,
+            mooncake_store_setup_with_offload,
             mooncake_store_health_check,
             mooncake_store_put,
             mooncake_store_put_from,
@@ -202,10 +231,12 @@ impl MooncakeStoreLib {
             mooncake_store_get_into,
             mooncake_store_batch_get_into,
             mooncake_store_is_exist,
+            mooncake_store_get_replica_status,
             mooncake_store_batch_is_exist,
             mooncake_store_get_size,
             mooncake_store_get_hostname,
             mooncake_store_remove,
+            mooncake_store_remove_durable,
             mooncake_store_remove_by_regex,
             mooncake_store_remove_all,
             mooncake_store_register_buffer,
@@ -248,6 +279,30 @@ impl MooncakeStoreLib {
         mount_segment_size: u64,
     ) -> ::std::os::raw::c_int {
         (self.mooncake_store_init_all)(store, protocol, device_name, mount_segment_size)
+    }
+    pub unsafe fn mooncake_store_setup_with_offload(
+        &self,
+        store: mooncake_store_t,
+        local_hostname: *const ::std::os::raw::c_char,
+        metadata_server: *const ::std::os::raw::c_char,
+        global_segment_size: u64,
+        local_buffer_size: u64,
+        protocol: *const ::std::os::raw::c_char,
+        device_name: *const ::std::os::raw::c_char,
+        master_server_addr: *const ::std::os::raw::c_char,
+        offload_path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_setup_with_offload)(
+            store,
+            local_hostname,
+            metadata_server,
+            global_segment_size,
+            local_buffer_size,
+            protocol,
+            device_name,
+            master_server_addr,
+            offload_path,
+        )
     }
     pub unsafe fn mooncake_store_health_check(
         &self,
@@ -322,6 +377,13 @@ impl MooncakeStoreLib {
     ) -> ::std::os::raw::c_int {
         (self.mooncake_store_is_exist)(store, key)
     }
+    pub unsafe fn mooncake_store_get_replica_status(
+        &self,
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_get_replica_status)(store, key)
+    }
     pub unsafe fn mooncake_store_batch_is_exist(
         &self,
         store: mooncake_store_t,
@@ -353,6 +415,13 @@ impl MooncakeStoreLib {
         force: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int {
         (self.mooncake_store_remove)(store, key, force)
+    }
+    pub unsafe fn mooncake_store_remove_durable(
+        &self,
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_remove_durable)(store, key)
     }
     pub unsafe fn mooncake_store_remove_by_regex(
         &self,
