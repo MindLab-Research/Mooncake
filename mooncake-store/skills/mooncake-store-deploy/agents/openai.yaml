@@ -1,0 +1,4 @@
+interface:
+  display_name: "跨地域 Mooncake Store 部署"
+  short_description: "部署共享 Master 与地域 Store，验证 Mint 经 OSS 双向交换及兼容回退"
+  default_prompt: "使用 $mooncake-store-deploy 部署共享 Master 和跨地域 Store，完成 Mint 接入与存储验收。"

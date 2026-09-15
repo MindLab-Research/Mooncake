@@ -9,7 +9,9 @@ description: 在 Mint 节点部署接入 OSS 的 Mooncake Store/provider 与 sid
 
 ## 先确定版本和网络
 
-记录 Mint/Mooncake commit、C header、动态库、Master/provider/sidecar SHA-256。不能把旧 runtime 的实验结果绑定成最新 PR 验收。本次已测试组合为 Mint 2fe97e16、Mooncake Master/动态库 39c34714、保留的 provider d86c547d。具体 hash 见随 PR 提交的验收 manifest；不能引用旧 runtime 结果替代新候选。
+记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。当前已验收运行源码为 Mooncake `a8657c7397ac23ec37550d9d5487026010041ab2`、Mint `90913210df556196f8ae51f86dac4e277b2e8c7f`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
+
+最终报告和可独立解包运行的 verifier 位于 Mooncake 仓库 `mooncake-store/validation/single-master-20260916/`。分发 skill 时，审计基准也可从[固定提交报告](https://github.com/MindLab-Research/Mooncake/blob/95814bfed6e41a29f319864d11bd3c552fbfddf0/mooncake-store/validation/single-master-20260916/README.md)获取。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
 
 每个节点必须能够访问同一个 Master RPC 和 HTTP metadata 服务；Master/客户端也必须能回连 provider offload RPC、Transfer Engine 和 TCP 数据端口。只通 50481 不够。动态端口要使用可双向路由的专网地址或测试 overlay；不要将公网任意端口全部开放。
 
@@ -70,28 +72,26 @@ python scripts/read_probe.py --config node.toml \
 
 记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。生产合并前另外完成 download_url token、真实历史 s3 回退、durable-delete/并发/失败保护及最终候选绑定。
 
-## 已实测的开发网络（2026-09-15）
+## 验收结论与使用边界
 
-北京开发机 `115.191.57.4` 的测试网络地址为 `10.254.254.1/30`；曼谷 `47.81.60.206` 为 `10.254.254.2/30`。Master 是 `10.254.254.1:50481`，metadata 是 `http://10.254.254.1:28482/metadata`。这些地址仅适用于本次环境，不应复制到任意 Mint 集群。
+2026-09-16 最终候选已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
 
-北京 `ctgg-mooncake-tunnel.service` 使用专用受限 SSH key 建立 `tun42`，曼谷 `ctgg-mooncake-tun-address.service` 配置对端地址；没有 Mac 转发依赖。两端只对另一开发机的公网 /32 路由配置 BBR。Cubic 测试出现反向 1 MiB 超时，BBR 后新 4 MiB 首读成功，但不是受控性能对比，也不是生产 WAN SLA。
+删除必须先完成 OSS durable delete，再清除 Master metadata。失败保留 metadata；两地验收还需并发重复删除、冷启动不复活及未删除正控可读。既有读租约约 900 秒，删除可能等待该窗口并需要重试；保留首次结果及累计时延，不得缩短保护窗口以加速验收。
 
-北京 Master 服务为 `ctgg-shared-mooncake-master.service`；两地 Store 服务为 `ctgg-mint-mooncake-oss.service`。使用 `systemctl show ... -p MainPID -p ActiveState` 核查，不要以 unit 文件存在判断服务存活。仅停止本任务服务，不停止同机其他 Master。
+`download_url` 要验证合法下载、签名篡改、错误密钥、过期、跨 artifact 重放，以及长度/截断错误；不得泄露 OSS/Mooncake 凭据。S3 门禁必须用真实后端验证历史 `s3://` 读取和 presign、切换 Mooncake 后 `mint://` 新写读、切回 S3 后继续新写。保留 `S3Persistence` 与旧 presign 路径。
 
-SSH TUN 是开发网络适配。生产优先使用已批准的双向可路由网络，并重新验证 RTT、吞吐、故障恢复、认证和访问控制。部署 skill 本身不代表获准修改生产网络或合并 PR。
+## 故障恢复
 
-96 MiB 后续实测：启用 Mint preferred_segments，并统一两地 OSS accelerate endpoint 后，双向 sidecar 写入、OSS hash 核对及源端离线后的目标冷读均通过。早期未传 preferred_segments 和标准 endpoint 的失败日志仍保留；不能将不同配置的实验混为同一候选。2026-09-15 新增 WAN metadata timeout 修复后的复测见工作区 evidence/2026-09-15/shared-master-network/wan-*。
+- `rc=-707`/namespace 不匹配：先核对两地 endpoint/bucket/prefix 一致，目标 provider 的 descriptor 已完成并可路由；不要绕过本地 offload endpoint 的 fail-closed 限制直接读 OSS。
+- metadata 超时：检查双向网络和实际进程环境。本次 WAN provider/sidecar 使用 `MC_METADATA_HTTP_CONNECT_TIMEOUT_MS=10000`、`MC_METADATA_HTTP_TIMEOUT_MS=30000`，上游默认仍为 1500/3000 ms。OSS accelerate 只加速对象访问，不会自动加速 Master RPC 或 SSH。
+- 源端停止后短暂旧 RAM route：记录即时失败及 client_ttl 收敛后的结果，不能静默重试后只报成功。
+- TCP 原生传输卡住：当前库在 `MC_STORE_TRANSFER_TIMEOUT_MS`（默认 60000 ms）期限后终止 TCP I/O 并 join，确认不再触碰缓冲区才返回失败。整个 transport 随后不可用，同一 transport 的并发调用也会失败。health 为 `HC_TRANSFER_UNAVAILABLE=3`，HTTP 503/`transfer_unavailable` 时，编排层应撤销 readiness 并重建受影响客户端/sidecar；进程未退出不代表健康。provider 同样受损时先恢复 provider，再重新获取 endpoint/segment 并启动 sidecar。不对同一失效客户端无限重试。
+- 非 TCP/Tent 不在本次安全取消保证内，保留其原有生命周期约束；Store deadline 也不是所有网络/metadata 阶段的端到端 SLA。
 
-配套候选部署注意：durable-read namespace 比较包含 endpoint。标准 OSS endpoint 与 accelerate endpoint 即使指向同一 bucket，也会被当前 Master 视为不同 namespace 并返回 NOT_SUPPORTED；同一共享 Master 下先统一 provider 的 endpoint/bucket/prefix。`preferred_segments` 需填写本次 provider 实际注册名（例如 IP:动态端口），不可把示例值跨重启复用。优先分配可能回退，不能当作硬性地域隔离。
+## 开发基准与生产接入
 
-退出收敛：停止源端后，Master 在 client_ttl 窗口内可能仍返回已失效内存副本。验收需记录即时读取失败与副本清理后的回源结果；不能静默重试并只报告成功。当前默认 metadata HTTP connect timeout 为 1500 ms，在测试 WAN 中已出现真实超时，生产网络超时预算仍需验证。
+已部署基准是北京 `115.191.57.4` / overlay `10.254.254.1`，曼谷 `47.81.60.206` / `10.254.254.2`；Master RPC 为北京 50481，metadata HTTP 为 28482。两地当前运行目录为 `/opt/mindlab/ctgg-safe-abort-a8657c73-90913210`。北京 `ctgg-shared-mooncake-master` 常驻，曼谷同名 unit 停止；两地 `ctgg-mint-mooncake-oss` 常驻。用 `systemctl show -p MainPID -p ActiveState` 和 `/proc/PID/exe`、加载库核查，不以目录名字代替版本证据。
 
-WAN metadata 超时补丁保留默认 1500 ms 连接/3000 ms 总预算；本次两地 Store service 明确设置 `MC_METADATA_HTTP_CONNECT_TIMEOUT_MS=10000` 和 `MC_METADATA_HTTP_TIMEOUT_MS=30000`。必须给 provider 和 sidecar 实际进程继承这两个变量；仅改交互 shell 无效。新动态库/provider 在 `ctgg-wan-timeout-20260915`，运行目录还需携带 `libasio.so`。北京 Master 维持 `671db7ab` 原二进制；补丁未修改 C ABI 或 RPC 协议。该混合版本安排需如实记录，不能声称 Master 也已换为新编译文件。
+开发机 SSH TUN/BBR 是测试网络适配，不依赖 Mac 转发，也不是生产 WAN SLA。部署到实际 Mint 集群时替换为批准的双向网络、服务地址、密钥注入和持久卷；固定审核后的镜像/源码及 hash，在目标网络重跑本 skill 的门禁。共享 Master 的 durable-delete journal 必须持久化并保留；本次没有验收多 Master 或控制面 HA。
 
-## 当前范围和合并门禁
-
-单 Master + 双地域 Store 的在线/源端离线冷读、live 删除、token 和历史 S3 回退已通过开发机验收。Master 只承担 metadata/routing，字节路径为 Store/provider ↔ OSS。读路由必须命中本地域已完成的 offload descriptor，缺失时 fail closed。
-
-成功删除可能等待既有约 900 秒读租约；调用方应保留可重试状态，不得缩短 fence 来让门禁变绿。独立 native OSS 故障注入不等同于共享服务的线上故障测试。
-
-开发验收 PASS 不等于代码审查通过。使用前核对 PR 中的审查报告与当前 CI；已知尚未关闭的通用启动兼容性、读 fence 路由和传输终止问题禁止据此直接宣称生产就绪。
+交付物包含节点无密钥配置、启动/回滚命令、版本 manifest、两方向原始读写/冷读/删除日志、token/S3 结果和时延定义。开发验收通过后交人工审核 PR，再安排生产部署；skill 不隐含合并或生产变更授权。
