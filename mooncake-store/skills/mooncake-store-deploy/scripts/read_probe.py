@@ -41,7 +41,8 @@ try:
             h.update(chunk.data)
             size += len(chunk.data)
     r.update(bytes=size, sha256=h.hexdigest())
-    assert size == a.bytes and h.hexdigest() == a.sha256, r
+    if size != a.bytes or h.hexdigest() != a.sha256:
+        raise ValueError("sidecar object length or SHA-256 mismatch")
     r["status"] = "PASS"
 except Exception as e:
     r["error"] = str(e)
