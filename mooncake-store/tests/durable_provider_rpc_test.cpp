@@ -23,6 +23,36 @@ DurableObjectStorageNamespace Scope() {
 }
 }  // namespace
 
+TEST(DurableProviderRpcTest, DiscoveryKeepsBothOwnersAndUnmountRemovesOnlyOne) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    MasterService master(config);
+    const auto first = generate_uuid();
+    const auto second = generate_uuid();
+    ASSERT_TRUE(master.MountLocalDiskSegment(first, true));
+    ASSERT_TRUE(master.MountLocalDiskSegment(second, true));
+    const OffloadTaskItem task{.tenant_id = "default", .key = "regional-key", .size = 1024};
+    StorageObjectMetadata a, b;
+    a.data_size = b.data_size = 1024;
+    a.transport_endpoint = "10.254.254.1:40000";
+    b.transport_endpoint = "10.254.254.2:40000";
+    ASSERT_TRUE(master.NotifyOffloadSuccess(first, {task}, {a}));
+    ASSERT_TRUE(master.NotifyOffloadSuccess(second, {task}, {b}));
+    ASSERT_TRUE(master.NotifyOffloadSuccess(second, {task}, {b}));
+    auto both = master.GetReplicaListForAdmin("regional-key", TenantId::Default());
+    ASSERT_TRUE(both);
+    ASSERT_EQ(both->replicas.size(), 2);
+    ASSERT_TRUE(master.UnmountLocalDiskSegment(first));
+    auto remaining = master.GetReplicaListForAdmin("regional-key", TenantId::Default());
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1);
+    EXPECT_EQ(remaining->replicas[0].get_local_disk_descriptor().client_id, second);
+    EXPECT_EQ(remaining->replicas[0].get_local_disk_descriptor().transport_endpoint,
+              b.transport_endpoint);
+    EXPECT_FALSE(master.NotifyOffloadSuccess(first, {task}, {a}));
+}
+
 TEST(DurableProviderRpcTest, ScopedRegistrationRoundtripAndUnmount) {
     WrappedMasterServiceConfig config;
     config.default_kv_lease_ttl = 0;

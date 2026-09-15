@@ -310,6 +310,29 @@ TEST_F(ReplicaSelectionTest, LocalDiskPrecedesDisk) {
     EXPECT_TRUE(sel->is_local_disk_replica());
 }
 
+TEST_F(ReplicaSelectionTest, RequiredOffloadOverridesLocalAndRemoteMemory) {
+    std::vector<Replica::Descriptor> reps = {
+        MakeMemory("local-memory", "tcp"),
+        MakeMemory("remote-memory", "tcp"),
+        MakeLocalDisk("10.254.254.1:40000"),
+        MakeLocalDisk("10.254.254.2:40000")};
+    const std::unordered_set<std::string> local = {"local-memory"};
+    EXPECT_EQ(SelectBestReplica(reps, local, ""), &reps[0]);
+    EXPECT_EQ(SelectBestReplica(reps, local, "10.254.254.2:40000"), &reps[3]);
+}
+
+TEST_F(ReplicaSelectionTest, RequiredOffloadDoesNotFallbackOrMatchPartialEndpoint) {
+    std::vector<Replica::Descriptor> reps = {
+        MakeMemory("10.254.254.2:40000", "tcp"),
+        MakeLocalDisk("10.254.254.20:40000"),
+        MakeLocalDisk("10.254.254.2:40001")};
+    EXPECT_EQ(SelectBestReplica(reps, {}, "10.254.254.2:40000"), nullptr);
+    auto pending = MakeLocalDisk("10.254.254.2:40000");
+    pending.status = ReplicaStatus::PROCESSING;
+    reps.push_back(pending);
+    EXPECT_EQ(SelectBestReplica(reps, {}, "10.254.254.2:40000"), nullptr);
+}
+
 TEST_F(ReplicaSelectionTest, DiskIsLastCompleteFallback) {
     std::unordered_set<std::string> local;
     std::vector<Replica::Descriptor> reps = {

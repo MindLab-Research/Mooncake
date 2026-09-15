@@ -100,6 +100,7 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 struct ReplicaSelectionEnvironmentVariables {
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_REQUIRED_OFFLOAD_ENDPOINT);
 };
 
 #undef MC_DEFINE_ENV_VAR
