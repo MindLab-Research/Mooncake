@@ -1222,6 +1222,19 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         result.value().object_checksum);
 }
 
+tl::expected<int, ErrorCode> Client::QueryReplicaStatus(const std::string& key) {
+    auto results = master_client_.BatchGetReplicaListForAdmin({key});
+    if (results.size() != 1) return tl::unexpected(ErrorCode::RPC_FAIL);
+    if (!results[0]) return tl::unexpected(results[0].error());
+    int status = 0;
+    for (const auto& replica : results[0]->replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE) continue;
+        if (replica.is_memory_replica()) status |= 1;
+        if (replica.is_local_disk_replica()) status |= 2;
+    }
+    return status;
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
     return BatchQuery(object_keys, master_client_.tenant_id());

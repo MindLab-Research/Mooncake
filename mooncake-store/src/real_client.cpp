@@ -4085,6 +4085,12 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     return results;
 }
 
+int RealClient::replica_status(const std::string &key) {
+    if (!client_) return toInt(ErrorCode::INVALID_PARAMS);
+    auto result = client_->QueryReplicaStatus(key);
+    return result ? *result : toInt(result.error());
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
     const std::vector<std::string> &keys) {
     if (!client_) {

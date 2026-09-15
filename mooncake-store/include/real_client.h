@@ -151,6 +151,7 @@ class RealClient : public PyClient {
      * @param keys Vector of keys to query
      * @return Vector of query results in the same order as keys
      */
+    int replica_status(const std::string &key);
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
 

@@ -157,6 +157,7 @@ class Client {
      * @return Vector of QueryResult objects containing replicas and lease
      * timeouts
      */
+    tl::expected<int, ErrorCode> QueryReplicaStatus(const std::string& key);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(

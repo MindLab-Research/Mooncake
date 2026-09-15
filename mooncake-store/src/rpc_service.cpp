@@ -1849,6 +1849,8 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

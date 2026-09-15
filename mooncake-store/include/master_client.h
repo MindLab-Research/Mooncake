@@ -190,6 +190,10 @@ class MasterClient {
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
                         const std::string& tenant_id);
 
+    // Status-only observations must never renew reader leases.
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& object_keys);
+
     /**
      * @brief Starts a put operation
      * @param key Object key

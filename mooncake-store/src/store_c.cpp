@@ -139,16 +139,8 @@ int mooncake_store_setup_with_offload(
 int mooncake_store_get_replica_status(mooncake_store_t store, const char *key) {
     if (!store || !key) return -1;
     try {
-        auto results = as_client(store)->batch_query({key});
-        if (results.size() != 1) return -1;
-        if (!results[0]) return mooncake::toInt(results[0].error());
-        int status = 0;
-        for (const auto &replica : results[0]->replicas) {
-            if (replica.status != mooncake::ReplicaStatus::COMPLETE) continue;
-            if (replica.is_memory_replica()) status |= 1;
-            if (replica.is_local_disk_replica()) status |= 2;
-        }
-        return status;
+        // Observing durability must not grant read leases or block eviction.
+        return as_client(store)->replica_status(key);
     } catch (...) {
         return -1;
     }

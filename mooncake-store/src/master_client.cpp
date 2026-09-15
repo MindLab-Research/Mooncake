@@ -63,6 +63,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListForAdmin> {
+    static constexpr const char* value = "BatchGetReplicaListForAdmin";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -586,6 +591,12 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
         object_keys.size(), object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
+                            GetReplicaListResponse>(keys.size(), keys, tenant_id_.value());
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
