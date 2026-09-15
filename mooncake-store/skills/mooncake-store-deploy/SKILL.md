@@ -1,6 +1,6 @@
 ---
 name: mooncake-store-deploy
-description: 在 Mint 节点部署接入 OSS 的 Mooncake Store/provider 与 sidecar，连接共享 Master，并验证跨节点读写和冷恢复。
+description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生产 Mint 集群：部署共享 Master、地域 provider 与同 Pod sidecar，验证跨地域读写并执行升级回滚。
 ---
 
 # Mint 接入 OSS-backed Mooncake Store
@@ -24,7 +24,7 @@ description: 在 Mint 节点部署接入 OSS 的 Mooncake Store/provider 与 sid
 1. 在控制面主机启动一个 Master。记录 RPC、HTTP metadata 地址和 Master PID。OSS durable-delete 候选应带持久 journal 路径，并验证重启恢复能力；旧版本缺此功能时不能报告删除门禁通过。
 2. 每个节点启动 provider，传入同一 Master/metadata 地址、本节点 host、segment 和 buffer 容量以及独立端口。OSS 配置仅通过 provider 的受保护环境文件注入。
 3. 确认 provider 日志出现 S3 backend、segment 挂载和 offload RPC 启动。从本次 provider 的 `LocalDiskDescriptor.transport_endpoint` 取得真实 offload endpoint，将 Mooncake 原生选项 `MC_STORE_REQUIRED_OFFLOAD_ENDPOINT` 注入 sidecar 进程，再启动 sidecar。该选项不是 Mint TOML 字段，也不是 Master 地址；provider 端口变化后必须更新并重启 sidecar。某些 provider 先启动 Unix IPC，稍后才启动配置的 TCP 端口；不能把端口短暂未监听当作 Master 网络断开。
-4. 确认两端 sidecar 能访问自己的 Store，进程环境不带云凭据；配置相同 bucket/endpoint/测试 prefix 才能验证共享 OSS 场景。TOS/R2 不同后端不因共享 Master 自动互通，必须另验数据路由。
+4. 确认两端 sidecar 能访问自己的 Store，进程环境不带 provider 的云凭据（历史 S3 回退使用 sidecar 独立挂载的凭据文件）；配置相同 bucket/endpoint/测试 prefix 才能验证共享 OSS 场景。TOS/R2 不同后端不因共享 Master 自动互通，必须另验数据路由。
 
 provider 关键参数（值从部署配置提供）：
 
@@ -70,7 +70,7 @@ python scripts/read_probe.py --config node.toml \
 
 双向执行。为了证明 OSS 冷读，停止源端 provider/sidecar，保留共享 Master；目标端使用新 Store 进程、新 segment 和空 sidecar 缓存目录。保存停止状态、PID、实际配置、provider 回源日志及结果。随后交换源和目标重复。每一阶段确认 Master PID未被区域 Store 停启改变。
 
-记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。生产合并前另外完成 download_url token、真实历史 s3 回退、durable-delete/并发/失败保护及最终候选绑定。
+记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。新部署按下述门禁做上线验证；当前提交的 download_url token、真实历史 S3 回退、durable-delete/并发/失败保护和版本绑定证据已通过。
 
 ## 验收结论与使用边界
 
@@ -85,7 +85,7 @@ python scripts/read_probe.py --config node.toml \
 - `rc=-707`/namespace 不匹配：先核对两地 endpoint/bucket/prefix 一致，目标 provider 的 descriptor 已完成并可路由；不要绕过本地 offload endpoint 的 fail-closed 限制直接读 OSS。
 - metadata 超时：检查双向网络和实际进程环境。本次 WAN provider/sidecar 使用 `MC_METADATA_HTTP_CONNECT_TIMEOUT_MS=10000`、`MC_METADATA_HTTP_TIMEOUT_MS=30000`，上游默认仍为 1500/3000 ms。OSS accelerate 只加速对象访问，不会自动加速 Master RPC 或 SSH。
 - 源端停止后短暂旧 RAM route：记录即时失败及 client_ttl 收敛后的结果，不能静默重试后只报成功。
-- TCP 原生传输卡住：当前库在 `MC_STORE_TRANSFER_TIMEOUT_MS`（默认 60000 ms）期限后终止 TCP I/O 并 join，确认不再触碰缓冲区才返回失败。整个 transport 随后不可用，同一 transport 的并发调用也会失败。health 为 `HC_TRANSFER_UNAVAILABLE=3`，HTTP 503/`transfer_unavailable` 时，编排层应撤销 readiness 并重建受影响客户端/sidecar；进程未退出不代表健康。provider 同样受损时先恢复 provider，再重新获取 endpoint/segment 并启动 sidecar。不对同一失效客户端无限重试。
+- TCP 原生传输卡住：当前库在 `MC_STORE_TRANSFER_TIMEOUT_MS`（默认 60000 ms）期限后终止 TCP I/O 并 join，确认不再触碰缓冲区才返回失败。整个 transport 随后不可用，同一 transport 的并发调用也会失败。health 为 `HC_TRANSFER_UNAVAILABLE=3`，原生客户端显式启动 HTTP server 后的 `/health` 返回 503/`transfer_unavailable` 时，编排层应撤销 readiness 并重建受影响客户端/sidecar；进程未退出不代表健康。provider 同样受损时先恢复 provider，再重新获取 endpoint/segment 并启动 sidecar。不对同一失效客户端无限重试。
 - 非 TCP/Tent 不在本次安全取消保证内，保留其原有生命周期约束；Store deadline 也不是所有网络/metadata 阶段的端到端 SLA。
 
 ## 开发基准与生产接入
@@ -93,5 +93,7 @@ python scripts/read_probe.py --config node.toml \
 已部署基准是北京 `115.191.57.4` / overlay `10.254.254.1`，曼谷 `47.81.60.206` / `10.254.254.2`；Master RPC 为北京 50481，metadata HTTP 为 28482。两地当前运行目录为 `/opt/mindlab/ctgg-safe-abort-a8657c73-90913210`。北京 `ctgg-shared-mooncake-master` 常驻，曼谷同名 unit 停止；两地 `ctgg-mint-mooncake-oss` 常驻。用 `systemctl show -p MainPID -p ActiveState` 和 `/proc/PID/exe`、加载库核查，不以目录名字代替版本证据。
 
 开发机 SSH TUN/BBR 是测试网络适配，不依赖 Mac 转发，也不是生产 WAN SLA。部署到实际 Mint 集群时替换为批准的双向网络、服务地址、密钥注入和持久卷；固定审核后的镜像/源码及 hash，在目标网络重跑本 skill 的门禁。共享 Master 的 durable-delete journal 必须持久化并保留；本次没有验收多 Master 或控制面 HA。
+
+生产发布与回滚的执行顺序见 [生产接入参考](references/production-rollout.md)。
 
 交付物包含节点无密钥配置、启动/回滚命令、版本 manifest、两方向原始读写/冷读/删除日志、token/S3 结果和时延定义。开发验收通过后交人工审核 PR，再安排生产部署；skill 不隐含合并或生产变更授权。

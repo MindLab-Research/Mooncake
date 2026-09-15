@@ -1,6 +1,6 @@
 # Store/provider 配置与启动参考
 
-这是已实测参数的可移植写法。`<...>` 必须替换为部署节点参数；不要直接复制本次开发机 IP 到生产。使用包含 S3 provider、durable C ABI 和 metadata timeout 和 TCP 安全终止补丁的候选构建，以及支持 preferred_segments 的 Mint sidecar。上游任意版本不保证支持这些参数。
+这是已实测参数的可移植写法。`<...>` 必须替换为部署节点参数；不要直接复制本次开发机 IP 到生产。使用包含 S3 provider、durable C ABI 和 metadata timeout、TCP 安全终止补丁的候选构建，以及支持 preferred_segments 的 Mint sidecar。上游任意版本不保证支持这些参数。
 
 ## 运行文件
 
@@ -118,7 +118,7 @@ max_inflight_tar_ops = 4
 workers = 2
 ```
 
-本示例监听 loopback，适用于同节点 Mint。容器/Pod 需明确 sidecar 的可达服务地址和访问控制；不要直接把 loopback 改成无认证公网监听。Mint 调用此 sidecar，不获得 provider 的云凭据。真实训练资源与业务调度配置是独立接入步骤，本存储测试不证明 GPU 训练闭环。
+本示例监听 loopback，适用于同节点 Mint。当前 sidecar 在配置解析和启动时强制 loopback。Kubernetes 中必须让调用它的 Mint API/业务进程与 sidecar 位于同一 Pod（共享网络命名空间）；普通独立 Pod 的 Service 地址方案不适用于当前二进制。provider 可独立部署，通过可路由地址与 sidecar/共享 Master 通信。Mint 调用此 sidecar，不获得 provider 的云凭据。真实训练资源与业务调度配置是独立接入步骤，本存储测试不证明 GPU 训练闭环。
 
 ## 常驻与故障恢复
 
@@ -137,7 +137,7 @@ workers = 2
 url = "http://127.0.0.1:17420"
 ```
 
-这是 Mint API 的配置，不是 sidecar TOML。跨 Pod 时替换为本地域私有服务地址。API 的模型 catalog 不会因为共享 Master 自动同步；通过当前候选提供的 artifact catalog export/import API 交接描述信息，再由目标 sidecar 读取对象。模型导入要求 base_model/LoRA metadata 匹配，不使用无模型 metadata 的普通 tar 冒充模型 checkpoint。下载 token 密钥在 API 侧安全配置，不复用 OSS 凭据。
+这是 Mint API 的配置，不是 sidecar TOML。保持 loopback，并将 API 与 sidecar 放在同一网络命名空间；不要替换成跨 Pod Service。API 的模型 catalog 不会因为共享 Master 自动同步；通过当前候选提供的 artifact catalog export/import API 交接描述信息，再由目标 sidecar 读取对象。模型导入要求 base_model/LoRA metadata 匹配，不使用无模型 metadata 的普通 tar 冒充模型 checkpoint。下载 token 使用 API `[auth] admin_management_token`，必须非空且与业务 `admin_token` 不同。通过受保护的 API TOML/Secret 配置；同一 API 的副本保持一致，轮换会使旧下载 token 失效。不要用 OSS 凭据代替。
 
 读取探针使用独立的部署参数 TOML（不要把下面字段塞入 sidecar TOML）：
 
@@ -149,3 +149,33 @@ sidecar = 17420
 ```
 
 Python 环境需要 Python 3.11+、grpcio、protobuf，以及从同一 Mint 候选的 `proto/store_sidecar.proto` 生成的 `store_sidecar_pb2.py` / `store_sidecar_pb2_grpc.py`。先用 `rg --files` 确认仓库中的 proto 实际位置，再通过 `python -m grpc_tools.protoc -I <PROTO_DIR> --python_out=<STUB_DIR> --grpc_python_out=<STUB_DIR> <PROTO_FILE>` 生成（构建环境还需 grpcio-tools）。该探针只读取已有 object_key，不负责写入；写入/Publish 与 API 验收使用报告中的对应实测脚本及其配置格式。
+
+## 生产配置与历史 S3 回退
+
+将上面的开发示例 `[base]` 替换为以下配置，删除 `dev_user`；`prd` 是源码支持的精确值，不是 `prod`。其余 observability、容量和路径采用集群现有规范：
+
+```toml
+[base]
+env = "prd"
+base_dir = "/var/lib/mint"
+```
+
+历史 S3 回退需要在已有 `[store]` 内添加以下字段（不要重复 TOML 表）；Mooncake 参数继续留在 `[store.mooncake]`：
+
+```toml
+# 属于 [store]
+kind = "mooncake"
+bucket = "<LEGACY_S3_BUCKET>"
+region = "<LEGACY_S3_REGION>"
+endpoint_internal = "<LEGACY_S3_INTERNAL_URL>"
+endpoint_external = "<CLIENT_REACHABLE_PRESIGN_URL>"
+# 按旧服务设置，不能假定所有兼容后端都需要 path style。
+force_path_style = true
+
+[s3]
+credentials_file = "/run/secrets/mint-legacy-s3.ini"
+```
+
+凭据文件权限 0600，格式为 `[default]` 下的 `aws_access_key_id` 和 `aws_secret_access_key`。这是旧 S3 的凭据，与 Mooncake provider 的 OSS 环境文件分别挂载；不注入 Mint API。当前候选只支持这里的静态 key 文件格式，不假定支持 session token 或自动 IAM role。未配置 endpoint 时 Mooncake 模式不会启用旧 S3 fallback；历史 `s3://` 的保留不能仅靠 `kind = "mooncake"` 达成。
+
+切回 S3 写入时将同一 `[store] kind` 改为 `s3`，保留上述 endpoint/bucket/credentials 配置并重启 sidecar。回滚前先验证历史 S3 的读写/presign；已写入的 `mint://` 对象仍依赖 Mooncake 路径，不能假定切回 S3 会迁移这些对象或继续支持所有 Mint URI 读取。
