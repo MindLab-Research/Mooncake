@@ -109,6 +109,7 @@ preferred_segments = ["<NODE_ROUTABLE_IP>:<CURRENT_SEGMENT_PORT>"]
 enable_ssd_offload = false
 require_offload = true
 offload_timeout_secs = 180
+delete_retry_timeout_secs = 960
 put_retry_timeout_secs = 60
 [cache]
 max_bytes = 17179869184
@@ -179,3 +180,7 @@ credentials_file = "/run/secrets/mint-legacy-s3.ini"
 凭据文件权限 0600，格式为 `[default]` 下的 `aws_access_key_id` 和 `aws_secret_access_key`。这是旧 S3 的凭据，与 Mooncake provider 的 OSS 环境文件分别挂载；不注入 Mint API。当前候选只支持这里的静态 key 文件格式，不假定支持 session token 或自动 IAM role。未配置 endpoint 时 Mooncake 模式不会启用旧 S3 fallback；历史 `s3://` 的保留不能仅靠 `kind = "mooncake"` 达成。
 
 切回 S3 写入时将同一 `[store] kind` 改为 `s3`，保留上述 endpoint/bucket/credentials 配置并重启 sidecar。回滚前先验证历史 S3 的读写/presign；已写入的 `mint://` 对象仍依赖 Mooncake 路径，不能假定切回 S3 会迁移这些对象或继续支持所有 Mint URI 读取。
+
+`delete_retry_timeout_secs` 从 Mint `3fe2ac61` 引入；上方配置示例面向包含该提交的审核后版本，不可原样用于旧 `90913210` 二进制（未知字段会被拒绝）。
+
+删除重试预算由 `delete_retry_timeout_secs` 单独控制（默认 960 秒），须覆盖 Master 的读租约；它不改变或缩短 Master 的 900 秒保护。调用方默认 DeleteArtifact RPC 期限为 1020 秒；若部署使用更长租约，同步增大两项预算。原生调用本身仍需传输层期限与安全终止，不能用 async 取消代替。

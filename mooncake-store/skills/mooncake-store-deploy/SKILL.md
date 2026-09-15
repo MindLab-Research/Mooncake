@@ -9,7 +9,7 @@ description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生�
 
 ## 先确定版本和网络
 
-记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。当前已验收运行源码为 Mooncake `a8657c7397ac23ec37550d9d5487026010041ab2`、Mint `90913210df556196f8ae51f86dac4e277b2e8c7f`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
+记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。历史 live 验收绑定的运行源码为 Mooncake `a8657c7397ac23ec37550d9d5487026010041ab2`、Mint `90913210df556196f8ae51f86dac4e277b2e8c7f`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
 
 最终报告和可独立解包运行的 verifier 位于 Mooncake 仓库 `mooncake-store/validation/single-master-20260916/`。分发 skill 时，审计基准也可从[固定提交报告](https://github.com/MindLab-Research/Mooncake/blob/95814bfed6e41a29f319864d11bd3c552fbfddf0/mooncake-store/validation/single-master-20260916/README.md)获取。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
 
@@ -72,11 +72,11 @@ python scripts/read_probe.py --config node.toml \
 
 双向执行。为了证明 OSS 冷读，停止源端 provider/sidecar，保留共享 Master；目标端使用新 Store 进程、新 segment 和空 sidecar 缓存目录。保存停止状态、PID、实际配置、provider 回源日志及结果。随后交换源和目标重复。每一阶段确认 Master PID未被区域 Store 停启改变。
 
-记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。新部署按下述门禁做上线验证；当前提交的 download_url token、真实历史 S3 回退、durable-delete/并发/失败保护和版本绑定证据已通过。
+记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。新部署按下述门禁做上线验证。下文历史 live 结果只适用于其绑定的运行版本；PR 后续运行代码变更须补充受影响门禁，不可直接继承通过结论。
 
 ## 验收结论与使用边界
 
-2026-09-16 最终候选已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
+2026-09-16 历史绑定候选（Mooncake `a8657c73`、Mint `90913210`）已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
 
 删除必须先完成 OSS durable delete，再清除 Master metadata。失败保留 metadata；两地验收还需并发重复删除、冷启动不复活及未删除正控可读。既有读租约约 900 秒，删除可能等待该窗口并需要重试；保留首次结果及累计时延，不得缩短保护窗口以加速验收。
 
@@ -92,10 +92,12 @@ python scripts/read_probe.py --config node.toml \
 
 ## 开发基准与生产接入
 
-已部署基准是北京 `115.191.57.4` / overlay `10.254.254.1`，曼谷 `47.81.60.206` / `10.254.254.2`；Master RPC 为北京 50481，metadata HTTP 为 28482。两地当前运行目录为 `/opt/mindlab/ctgg-safe-abort-a8657c73-90913210`。北京 `ctgg-shared-mooncake-master` 常驻，曼谷同名 unit 停止；两地 `ctgg-mint-mooncake-oss` 常驻。用 `systemctl show -p MainPID -p ActiveState` 和 `/proc/PID/exe`、加载库核查，不以目录名字代替版本证据。
+开发基准的节点地址、运行目录和进程证据见前述固定提交验收报告。部署时填写本次获准的控制面及地域服务地址；用 `systemctl show -p MainPID -p ActiveState` 和 `/proc/PID/exe`、加载库核查，不以目录名字代替版本证据。
 
 开发机 SSH TUN/BBR 是测试网络适配，不依赖 Mac 转发，也不是生产 WAN SLA。部署到实际 Mint 集群时替换为批准的双向网络、服务地址、密钥注入和持久卷；固定审核后的镜像/源码及 hash，在目标网络重跑本 skill 的门禁。共享 Master 的 durable-delete journal 必须持久化并保留；本次没有验收多 Master 或控制面 HA。
 
 生产发布与回滚的执行顺序见 [生产接入参考](references/production-rollout.md)。
 
 交付物包含节点无密钥配置、启动/回滚命令、版本 manifest、两方向原始读写/冷读/删除日志、token/S3 结果和时延定义。开发验收通过后交人工审核 PR，再安排生产部署；skill 不隐含合并或生产变更授权。
+
+Mint 仓库中的配置模板、固定依赖和活体测试入口见 [Mint 验证入口](references/mint-validation.md)。
