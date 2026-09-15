@@ -1,5 +1,9 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_executable(http_metadata_config_test http_metadata_config_test.cpp)
+target_include_directories(http_metadata_config_test PRIVATE ../include)
+add_test(NAME http_metadata_config_test COMMAND http_metadata_config_test)
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)
