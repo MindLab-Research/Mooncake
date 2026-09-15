@@ -39,7 +39,8 @@ enum HealthCheckStatus : int {
     HC_HEALTHY = 0,          // Fully connected, all links up
     HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
     HC_MASTER_UNREACHABLE =
-        2  // Master (or RealClient for DummyClient) unreachable
+        2,  // Master (or RealClient for DummyClient) unreachable
+    HC_TRANSFER_UNAVAILABLE = 3  // Transport aborted; recreate the client
 };
 
 template <typename ResultValue, typename ErrorFactory>

@@ -169,6 +169,11 @@ class TcpTransport : public Transport {
     Status submitTransferTaskGroup(
         const std::vector<TransferTask *> &task_list) override;
 
+    Status abortBatch(BatchID batch_id) override;
+    bool isAvailable() const override {
+        return running_.load(std::memory_order_acquire);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
@@ -209,6 +214,7 @@ class TcpTransport : public Transport {
    private:
     TcpContext *context_;
     std::atomic_bool running_;
+    std::mutex abort_mutex_;
     std::unique_ptr<TcpIoPool> io_pool_;
     size_t num_io_threads_ = 1;
     bool enable_connection_pool_ = true;

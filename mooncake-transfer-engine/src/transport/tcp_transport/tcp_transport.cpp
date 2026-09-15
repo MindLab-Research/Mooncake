@@ -373,6 +373,32 @@ TcpTransport::TcpTransport()
         kDefaultNumIoThreads, 1, kMaxNumIoThreads);
 }
 
+Status TcpTransport::abortBatch(BatchID batch_id) {
+    // Never join an executor from one of its own threads.
+    if (io_pool_) {
+        for (size_t i = 0; i < io_pool_->size(); ++i) {
+            if (io_pool_->executor(i).running_in_this_thread())
+                return Status::InvalidArgument(
+                    "TCP abort cannot run on its I/O executor");
+        }
+    }
+    std::lock_guard<std::mutex> lock(abort_mutex_);
+    shutdownConnectionLanes();
+    // shutdown joined every I/O thread. One-shot sessions (pool disabled) can
+    // still own unexecuted callbacks, but the stopped pool is never restarted.
+    // Publish failure for their slices only AFTER that quiescence barrier.
+    auto& batch = toBatchDesc(batch_id);
+    for (auto& task : batch.task_list) {
+        if (task.transport_ != this) continue;
+        for (auto* slice : task.slice_list) {
+            if (slice->status != Slice::SUCCESS &&
+                slice->status != Slice::FAILED)
+                slice->markFailed();
+        }
+    }
+    return Status::OK();
+}
+
 TcpTransport::~TcpTransport() {
     shutdownConnectionLanes();
 
@@ -721,6 +747,12 @@ void TcpTransport::startTransfer(Slice* slice,
         }
     };
 
+    if (!running_.load(std::memory_order_acquire)) {
+        failWorkItem(TcpWorkItem(slice, false, std::move(continuation)),
+                     WorkFailureReason::SHUTDOWN,
+                     lane_state_->failure_counters);
+        return;
+    }
     auto desc = metadata_->getSegmentDescByID(slice->target_id);
     if (!desc) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "

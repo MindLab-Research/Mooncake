@@ -1894,6 +1894,7 @@ int RealClient::health_check() {
     if (closed_.load()) return HC_NOT_INITIALIZED;
     if (!client_) return HC_NOT_INITIALIZED;
     if (!client_->is_ping_healthy()) return HC_MASTER_UNREACHABLE;
+    if (!client_->is_transfer_healthy()) return HC_TRANSFER_UNAVAILABLE;
     return HC_HEALTHY;
 }
 
@@ -1920,6 +1921,9 @@ int RealClient::start_http_server(int port) {
                     break;
                 case HC_MASTER_UNREACHABLE:
                     status_str = "master_unreachable";
+                    break;
+                case HC_TRANSFER_UNAVAILABLE:
+                    status_str = "transfer_unavailable";
                     break;
                 default:
                     status_str = "unknown";

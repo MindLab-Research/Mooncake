@@ -723,6 +723,13 @@ class Client {
     }
 
     bool is_ping_healthy() const { return last_ping_success_.load(); }
+    bool is_transfer_healthy() const {
+        if (!transfer_engine_) return false;
+        auto* transport = transfer_engine_->getTransport(protocol_);
+        auto* tcp = transfer_engine_->getTransport("tcp");
+        return (!transport || transport->isAvailable()) &&
+               (!tcp || tcp->isAvailable());
+    }
 
     /**
      * @brief Get current frequency admission count for a key.

@@ -4,7 +4,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <future>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <endian.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -98,6 +106,160 @@ TEST_F(TransferTaskTest,
     transfer.join();
     EXPECT_TRUE(safe_to_release_buffer);
     EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+// A real TCP peer that accepts connections and never sends a response. It
+// remains alive beyond the Store deadline, so peer teardown cannot pass the
+// test accidentally. Late bytes are sent only after both callers returned.
+class UnresponsiveTcpPeer {
+   public:
+    UnresponsiveTcpPeer() {
+        listener_ = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (listener_ < 0 ||
+            bind(listener_, reinterpret_cast<sockaddr*>(&address),
+                 sizeof(address)) ||
+            listen(listener_, 8))
+            return;
+        socklen_t length = sizeof(address);
+        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&address),
+                        &length))
+            return;
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] {
+            while (!stop_.load()) {
+                pollfd fd{listener_, POLLIN, 0};
+                if (poll(&fd, 1, 20) <= 0) continue;
+                int peer = accept(listener_, nullptr, nullptr);
+                if (peer >= 0) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    peers_.push_back(peer);
+                }
+            }
+        });
+    }
+    ~UnresponsiveTcpPeer() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+        for (int peer : peers_) close(peer);
+        if (listener_ >= 0) close(listener_);
+    }
+    uint16_t port() const { return port_; }
+    bool wait_for_connections(size_t count) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (peers_.size() >= count) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+    void send_late_bytes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int peer : peers_) {
+            const uint64_t status = htole64(0x4D435456ull << 32);
+            std::vector<char> bytes(sizeof(status) + 128 * 1024, 'q');
+            std::memcpy(bytes.data(), &status, sizeof(status));
+            (void)send(peer, bytes.data(), bytes.size(),
+                       MSG_NOSIGNAL | MSG_DONTWAIT);
+        }
+    }
+
+   private:
+    int listener_ = -1;
+    uint16_t port_ = 0;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::vector<int> peers_;
+};
+
+TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
+    ScopedEnvVar deadline("MC_STORE_TRANSFER_TIMEOUT_MS", "50");
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "2");
+    for (const char* pooled : {"0", "1"}) {
+        ScopedEnvVar pool("MC_TCP_ENABLE_CONNECTION_POOL", pooled);
+        for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+            SCOPED_TRACE(std::string("pool=") + pooled +
+                         ", op=" + std::to_string(opcode));
+            UnresponsiveTcpPeer peer;
+            ASSERT_NE(peer.port(), 0);
+            constexpr size_t length = 128 * 1024;
+            void* mapping = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            ASSERT_NE(mapping, MAP_FAILED);
+            auto unmap = [](void* address) { munmap(address, length); };
+            std::unique_ptr<void, decltype(unmap)> allocation(mapping, unmap);
+            std::span<char> buffer(static_cast<char*>(mapping), length);
+            std::fill(buffer.begin(), buffer.end(), 'x');
+            TransferEngine engine(false);
+            ASSERT_EQ(
+                engine.init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+            auto* transport = engine.installTransport("tcp", nullptr);
+            ASSERT_NE(transport, nullptr);
+            ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
+                                                 "cpu:0"),
+                      0);
+            const auto segment = engine.openSegment(engine.getLocalIpAndPort());
+            auto description =
+                engine.getMetadata()->getSegmentDescByID(segment);
+            ASSERT_NE(description, nullptr);
+            description->tcp_data_port = peer.port();
+            description->tcp_proto_version = 2;
+            description->tcp_data_host = "127.0.0.1";
+            std::vector<TransferRequest> requests(1);
+            requests[0].opcode = opcode;
+            requests[0].source = buffer.data();
+            requests[0].length = buffer.size();
+            requests[0].target_id = segment;
+            requests[0].target_offset =
+                reinterpret_cast<uint64_t>(buffer.data());
+            const auto first = engine.allocateBatchID(1);
+            const auto second = engine.allocateBatchID(1);
+            ASSERT_TRUE(engine.submitTransfer(first, requests).ok());
+            ASSERT_TRUE(engine.submitTransfer(second, requests).ok());
+            ASSERT_TRUE(peer.wait_for_connections(2));
+            {
+                TransferEngineOperationState a(engine, first, 1),
+                    b(engine, second, 1);
+                const auto start = std::chrono::steady_clock::now();
+                auto one = std::async(std::launch::async,
+                                      [&] { a.wait_for_completion(); });
+                auto two = std::async(std::launch::async,
+                                      [&] { b.wait_for_completion(); });
+                one.get();
+                two.get();
+                EXPECT_LT(std::chrono::steady_clock::now() - start,
+                          std::chrono::seconds(3));
+                EXPECT_EQ(a.get_result(), ErrorCode::TRANSFER_FAIL);
+                EXPECT_EQ(b.get_result(), ErrorCode::TRANSFER_FAIL);
+                EXPECT_FALSE(transport->isAvailable());
+                // Quiescence precedes caller buffer reuse; late network data
+                // must not overwrite it, even while the engine remains alive.
+                std::fill(buffer.begin(), buffer.end(), 'z');
+                ASSERT_EQ(mprotect(mapping, length, PROT_NONE), 0);
+                peer.send_late_bytes();
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                ASSERT_EQ(mprotect(mapping, length, PROT_READ | PROT_WRITE), 0);
+                EXPECT_TRUE(std::all_of(buffer.begin(), buffer.end(),
+                                        [](char c) { return c == 'z'; }));
+            }
+            // The poisoned transport refuses further work without hanging.
+            const auto rejected = engine.allocateBatchID(1);
+            ASSERT_TRUE(engine.submitTransfer(rejected, requests).ok());
+            {
+                TransferEngineOperationState state(engine, rejected, 1);
+                state.wait_for_completion();
+                EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+            }
+            ASSERT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+        }
+    }
 }
 
 // Test MemcpyOperationState functionality
