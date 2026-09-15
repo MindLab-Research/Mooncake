@@ -285,11 +285,22 @@ WrappedMasterService::CheckDurableReadFence(std::string key,
             return master_service_.PrepareDurableRead(key, tenant);
         });
     if (!routes) co_return tl::make_unexpected(routes.error());
+    if (routes->empty()) co_return tl::expected<void, ErrorCode>{};
+    ErrorCode last_error = ErrorCode::RPC_FAIL;
     for (auto& command : *routes) {
         auto check = co_await RequestDurableProviderRead(std::move(command));
-        if (!check) co_return tl::make_unexpected(check.error());
+        if (check) co_return tl::expected<void, ErrorCode>{};
+        last_error = check.error();
+        // Never turn a tombstone, permission denial or protocol mismatch into
+        // success by trying a peer. Only equivalent-scope availability failures
+        // permit failover; a successful check remains authoritative.
+        if (last_error != ErrorCode::RPC_FAIL &&
+            last_error != ErrorCode::RPC_TIMEOUT &&
+            last_error != ErrorCode::DFS_NETWORK_TIMEOUT &&
+            last_error != ErrorCode::DFS_SERVICE_UNAVAILABLE)
+            co_return tl::make_unexpected(last_error);
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::make_unexpected(last_error);
 }
 
 async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>

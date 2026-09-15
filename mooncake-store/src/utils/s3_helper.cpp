@@ -176,6 +176,13 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         config.endpointOverride = env.GetAwsS3Endpoint();
     }
 
+    // An explicit URI is authoritative for its scheme. Do not silently turn
+    // a configured TLS endpoint into plaintext because of an independent flag.
+    if (config.endpointOverride.starts_with("https://"))
+        config.scheme = Aws::Http::Scheme::HTTPS;
+    else if (config.endpointOverride.starts_with("http://"))
+        config.scheme = Aws::Http::Scheme::HTTP;
+
     bucket_ = env.GetAwsBucketName();
     if (!bucket.empty()) {
         bucket_ = bucket;

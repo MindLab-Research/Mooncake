@@ -2614,6 +2614,12 @@ class MasterService {
                    it_->second.IsValid();
         }
 
+        bool IsDurableDeleteFenced() const NO_THREAD_SAFETY_ANALYSIS {
+            return tenant_state_ != nullptr &&
+                   tenant_state_->durable_deletions.contains(
+                       object_id_.user_key);
+        }
+
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr &&
                    processing_it_ != tenant_state_->processing_keys.end();

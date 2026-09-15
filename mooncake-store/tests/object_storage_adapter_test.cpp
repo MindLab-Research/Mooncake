@@ -1,4 +1,5 @@
 #include "storage/distributed/object_storage_adapter.h"
+#include "storage/distributed/s3_object_storage_adapter.h"
 
 #include <gtest/gtest.h>
 
@@ -709,4 +710,25 @@ TEST_F(ObjectStorageAdapterTest, RejectsAmbiguousAdapterSelection) {
 }
 
 }  // namespace
+}  // namespace mooncake
+
+namespace mooncake {
+TEST(S3ObjectStorageConfigTest, RequiresExplicitCredentialFreeOrigin) {
+    S3ObjectStorageConfig config;
+    config.bucket = "bucket";
+    config.region = "region";
+    config.key_prefix = "isolated-prefix";
+    for (const std::string endpoint :
+         {"", "https://", "http:///bad", "ftp://host", "https://host/path",
+          "https://user:secret@host", "https://host?key=value",
+          "https://host#fragment", "https://bad host"}) {
+        config.endpoint = endpoint;
+        EXPECT_FALSE(config.Validate()) << endpoint;
+    }
+    for (const std::string endpoint :
+         {"https://oss.example.test", "http://127.0.0.1:9000"}) {
+        config.endpoint = endpoint;
+        EXPECT_TRUE(config.Validate()) << endpoint;
+    }
+}
 }  // namespace mooncake

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <atomic>
+#include <algorithm>
 #include <future>
 #include <filesystem>
 #include <unistd.h>
@@ -456,5 +457,87 @@ TEST(DurableProviderRpcTest,
     EXPECT_FALSE(master.GetReplicaListForAdmin("receipt-key"));
     EXPECT_TRUE(client.RemoveDurable("receipt-key"));
     handler.StopAndDrain();
+}
+}  // namespace mooncake::test
+
+namespace mooncake::test {
+TEST(DurableProviderRpcTest,
+     ReadFenceFailsOverOnlyWithinScopeAndOnAvailability) {
+    char directory[] = "/tmp/mooncake-read-failover-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::filesystem::remove_all(path); }
+    } cleanup{directory};
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.enable_offload = true;
+    config.enable_metric_reporting = false;
+    config.durable_delete_journal_path = std::string(directory) + "/journal";
+    WrappedMasterService master(config);
+    std::vector<UUID> ids{generate_uuid(), generate_uuid()};
+    std::sort(ids.begin(), ids.end());
+    std::atomic<ErrorCode> first_result{ErrorCode::DFS_PERMISSION_DENIED};
+    std::atomic<int> peer_checks{0};
+    DurableDeleteRpcHandler first, peer;
+    first.SetReadExecutor(
+        [&](const DurableReadCommand&) -> tl::expected<void, ErrorCode> {
+            return tl::make_unexpected(first_result.load());
+        });
+    peer.SetReadExecutor([&](const DurableReadCommand& command)
+                             -> tl::expected<void, ErrorCode> {
+        ++peer_checks;
+        EXPECT_EQ(command.storage_namespace, Scope());
+        return {};
+    });
+    coro_rpc::coro_rpc_server a(1, 0, "127.0.0.1"), b(1, 0, "127.0.0.1");
+    a.register_handler<&DurableDeleteRpcHandler::CheckRead>(&first);
+    b.register_handler<&DurableDeleteRpcHandler::CheckRead>(&peer);
+    a.async_start();
+    b.async_start();
+    ASSERT_FALSE(a.get_errc());
+    ASSERT_FALSE(b.get_errc());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto endpoint =
+            "127.0.0.1:" + std::to_string(i == 0 ? a.port() : b.port());
+        ASSERT_TRUE(master.MountLocalDiskSegment(ids[i], true));
+        ASSERT_TRUE(
+            master.RegisterDurableDeleteProvider(ids[i], Scope(), endpoint));
+        StorageObjectMetadata metadata;
+        metadata.data_size = 1024;
+        metadata.transport_endpoint = endpoint;
+        ASSERT_TRUE(master.NotifyOffloadSuccess(
+            ids[i],
+            {OffloadTaskItem{
+                .tenant_id = "default", .key = "failover-key", .size = 1024}},
+            {metadata}));
+    }
+    // An unrelated v2 namespace must not receive the v3 CheckRead RPC.
+    auto legacy_id = generate_uuid();
+    auto legacy = Scope();
+    legacy.protocol_version = 2;
+    legacy.bucket = "legacy-bucket";
+    ASSERT_TRUE(master.MountLocalDiskSegment(legacy_id, true));
+    ASSERT_TRUE(
+        master.RegisterDurableDeleteProvider(legacy_id, legacy, "127.0.0.1:1"));
+    auto denied =
+        async_simple::coro::syncAwait(master.GetReplicaList("failover-key"));
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error(), ErrorCode::DFS_PERMISSION_DENIED);
+    EXPECT_EQ(peer_checks, 0);
+    first_result = ErrorCode::OBJECT_NOT_FOUND;
+    EXPECT_FALSE(
+        async_simple::coro::syncAwait(master.GetReplicaList("failover-key")));
+    EXPECT_EQ(peer_checks, 0);
+    first_result = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+    EXPECT_TRUE(
+        async_simple::coro::syncAwait(master.GetReplicaList("failover-key")));
+    EXPECT_EQ(peer_checks, 1);
+    a.stop();
+    EXPECT_TRUE(
+        async_simple::coro::syncAwait(master.GetReplicaList("failover-key")));
+    EXPECT_EQ(peer_checks, 2);
+    first.StopAndDrain();
+    peer.StopAndDrain();
 }
 }  // namespace mooncake::test

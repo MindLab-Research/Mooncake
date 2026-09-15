@@ -280,6 +280,7 @@ def run(args):
                     [
                         str(BIN / "mooncake_master"),
                         "--port=15400",
+                        f"--durable_delete_journal_path={directory / 'durable-delete.journal'}",
                         "--rpc_address=127.0.0.1",
                         "--rpc_thread_num=2",
                         "--enable_offload=true",

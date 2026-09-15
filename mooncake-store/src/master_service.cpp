@@ -6709,24 +6709,46 @@ MasterService::PrepareDurableRead(const std::string& key,
     if (key.empty() || !tenant_id.IsValid())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     if (!durable_delete_journal_) return std::vector<DurableReadCommand>{};
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     std::shared_lock snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRO accessor(this, object_id);
+    if (!accessor.Exists())
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    if (accessor.IsDurableDeleteFenced())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     std::lock_guard lock(durable_provider_mutex_);
     std::vector<DurableReadCommand> routes;
     std::optional<DurableObjectStorageNamespace> scope;
-    for (const auto& [id, candidate] : durable_providers_) {
+    // Scope the cloud check to this object's durable owners. Unrelated legacy
+    // namespaces must not disable v3 reads, nor should a provider restart block
+    // memory-only objects. Unknown offload ownership remains fail closed.
+    for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        const auto owner = replica.get_local_disk_client_id();
+        if (!owner) continue;
+        const auto provider = durable_providers_.find(*owner);
+        if (provider == durable_providers_.end())
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        const auto& candidate = provider->second;
+        if (candidate.protocol_version != kDurableReadFenceProtocolVersion)
+            continue;
         if (scope && *scope != candidate)
             return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
         scope = candidate;
+    }
+    if (!scope) return routes;
+    for (const auto& [id, candidate] : durable_providers_) {
+        if (candidate != *scope) continue;
         const auto endpoint = durable_provider_endpoints_.find(id);
         if (endpoint != durable_provider_endpoints_.end() &&
             local_ssd_manager_.GetUsage(id))
-            routes.push_back(
-                {id, tenant_id.value(), key, candidate, endpoint->second});
+            routes.push_back({id, object_id.tenant_id.value(), key, candidate,
+                              endpoint->second});
     }
     if (routes.empty())
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    // One authoritative cloud check suffices for an identical physical scope.
-    routes.resize(1);
+    // Every returned route checks the same physical namespace. The RPC layer
+    // may try another route only after a transport/service availability error.
     return routes;
 }
 

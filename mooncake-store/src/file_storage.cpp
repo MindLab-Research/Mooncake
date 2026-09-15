@@ -1414,9 +1414,9 @@ tl::expected<void, ErrorCode> FileStorage::AdvertiseDurableDeleteNamespace() {
     const auto registered =
         client_->RegisterDurableDeleteProvider(*scope, local_rpc_addr_);
     if (!registered) {
-        // Old Masters may lack this RPC. Ordinary offloading remains
-        // compatible; unregistered providers cannot pass durable-delete
-        // admission.
+        // Protocol v3 requires a journal-backed Master before mounting.
+        // Legacy protocols remain optional, but silently downgrading v3
+        // would bypass the advertised durable read/delete fencing contract.
         LOG_EVERY_N(WARNING, 60)
             << "Object storage deletion capability not registered: "
             << registered.error();

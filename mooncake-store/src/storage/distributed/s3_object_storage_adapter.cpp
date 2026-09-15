@@ -21,11 +21,22 @@ S3ObjectStorageConfig S3ObjectStorageConfig::FromEnvironment() {
 }
 
 bool S3ObjectStorageConfig::Validate() const {
+    // A durable namespace needs an explicit, credential-free HTTP(S) origin.
+    // Reject it before any SDK request rather than mounting an unusable Store.
+    const auto scheme_end = endpoint.find("://");
+    if (!(endpoint.starts_with("https://") ||
+          endpoint.starts_with("http://")) ||
+        endpoint.find_first_of("@?# \r\n\t") != std::string::npos ||
+        endpoint.find('\0') != std::string::npos)
+        return false;
+    const auto authority = endpoint.substr(scheme_end + 3);
+    if (authority.empty() || authority.find('/') != std::string::npos)
+        return false;
     return !bucket.empty() && !region.empty() && !key_prefix.empty() &&
            key_prefix.size() <= 909 &&
            key_prefix.find('\0') == std::string::npos &&
            bucket.find('\0') == std::string::npos &&
-           endpoint.find('@') == std::string::npos;
+           region.find('\0') == std::string::npos;
 }
 
 }  // namespace mooncake
