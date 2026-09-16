@@ -11,7 +11,10 @@ namespace mooncake {
 
 // Standalone Master journal. The parent directory must already exist on
 // persistent local storage. An exclusive file lock prevents split ownership.
-// Corruption, missing permissions and I/O failure fail closed. This is not an
+// An incomplete final append is truncated and fsynced during recovery.
+// Complete-record corruption, missing permissions and I/O failure fail closed.
+// Tombstones remain permanent; provision disk and RAM for lifetime key count.
+// This is not an
 // HA/replicated log and must never be used to acknowledge HA deletion.
 class DurableDeleteJournal {
    public:

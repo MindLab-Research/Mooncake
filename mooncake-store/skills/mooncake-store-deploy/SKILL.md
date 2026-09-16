@@ -11,7 +11,7 @@ description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生�
 
 记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。历史 live 验收绑定的运行源码为 Mooncake `a8657c7397ac23ec37550d9d5487026010041ab2`、Mint `90913210df556196f8ae51f86dac4e277b2e8c7f`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
 
-最终报告和可独立解包运行的 verifier 位于 Mooncake 仓库 `mooncake-store/validation/single-master-20260916/`。分发 skill 时，审计基准也可从[固定提交报告](https://github.com/MindLab-Research/Mooncake/blob/95814bfed6e41a29f319864d11bd3c552fbfddf0/mooncake-store/validation/single-master-20260916/README.md)获取。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
+原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前审查发现的传输恢复和 writer marker 回收问题尚未全部关闭，不得将历史 PASS 当作当前候选的生产放行依据。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
 
 每个节点必须能够访问同一个 Master RPC 和 HTTP metadata 服务；Master/客户端也必须能回连 provider offload RPC、Transfer Engine 和 TCP 数据端口。只通 50481 不够。动态端口要使用可双向路由的专网地址或测试 overlay；不要将公网任意端口全部开放。
 

@@ -666,6 +666,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                       << " chosen=" << chosen;
         }
         transport = transport_map_[chosen].get();
+        if (!transport->isAvailable()) {
+            return Status::NotSupportedTransport(
+                "Transport unavailable; recreate the client before retrying");
+        }
         return Status::OK();
     }
 #endif
@@ -682,6 +686,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     if (!transport_map_.count(proto) && proto == "rdma" &&
         transport_map_.count("rdma_twosided")) {
         transport = transport_map_["rdma_twosided"].get();
+        if (!transport->isAvailable()) {
+            return Status::NotSupportedTransport(
+                "Transport unavailable; recreate the client before retrying");
+        }
         return Status::OK();
     }
     if (!transport_map_.count(proto)) {
@@ -689,6 +697,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                              " not installed");
     }
     transport = transport_map_[proto].get();
+    if (!transport->isAvailable()) {
+        return Status::NotSupportedTransport(
+            "Transport unavailable; recreate the client before retrying");
+    }
     return Status::OK();
 }
 
@@ -759,6 +771,10 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
             " not supported by target segment");
     }
     transport = transport_map_[preferred_proto].get();
+    if (!transport->isAvailable()) {
+        return Status::NotSupportedTransport(
+            "Transport unavailable; recreate the client before retrying");
+    }
     return Status::OK();
 }
 #endif

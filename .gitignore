@@ -209,3 +209,6 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+
+# Generated regional acceptance data belongs in external artifact storage.
+/mooncake-store/validation/

@@ -117,7 +117,8 @@ TEST_F(DurableDeleteJournalTest, ReaderGraceBoundAndLegacyUnknown) {
     EXPECT_FALSE(journal.Commit(record));
 }
 
-TEST_F(DurableDeleteJournalTest, TornTailAndCorruptionFailClosed) {
+TEST_F(DurableDeleteJournalTest,
+       TornTailRecoversButCompleteRecordCorruptionFailsClosed) {
     {
         DurableDeleteJournal journal(path);
         ASSERT_TRUE(
@@ -128,8 +129,18 @@ TEST_F(DurableDeleteJournalTest, TornTailAndCorruptionFailClosed) {
         std::ofstream file(path, std::ios::app);
         file << "v1 partial";
     }
-    EXPECT_THROW(DurableDeleteJournal journal(path), std::runtime_error);
-    std::filesystem::resize_file(path, length);
+    {
+        DurableDeleteJournal journal(path);
+        ASSERT_EQ(journal.Records().size(), 1);
+        EXPECT_EQ(journal.Records()[0].key, "key");
+        EXPECT_EQ(std::filesystem::file_size(path), length);
+        ASSERT_TRUE(
+            journal.Commit({"tenant", "next", "operation", false, "scope-a"}));
+    }
+    {
+        DurableDeleteJournal journal(path);
+        EXPECT_EQ(journal.Records().size(), 2);
+    }
     {
         std::fstream file(path, std::ios::in | std::ios::out);
         file.put('x');
@@ -137,7 +148,8 @@ TEST_F(DurableDeleteJournalTest, TornTailAndCorruptionFailClosed) {
     EXPECT_THROW(DurableDeleteJournal journal(path), std::runtime_error);
 }
 
-TEST_F(DurableDeleteJournalTest, PartialWriteCannotAcknowledgeOrRecover) {
+TEST_F(DurableDeleteJournalTest,
+       PartialWriteCannotAcknowledgeAndRecoveryCanAppend) {
     const auto pid = fork();
     ASSERT_GE(pid, 0);
     if (pid == 0) {
@@ -156,7 +168,25 @@ TEST_F(DurableDeleteJournalTest, PartialWriteCannotAcknowledgeOrRecover) {
     ASSERT_EQ(waitpid(pid, &status, 0), pid);
     ASSERT_TRUE(WIFEXITED(status));
     ASSERT_EQ(WEXITSTATUS(status), 0);
-    EXPECT_THROW(DurableDeleteJournal journal(path), std::runtime_error);
+    DurableDeleteJournal journal(path);
+    EXPECT_TRUE(journal.Records().empty());
+    EXPECT_EQ(std::filesystem::file_size(path), 0);
+    EXPECT_TRUE(journal.Commit(
+        {"tenant", "after-crash", "operation", false, "scope-a"}));
+}
+
+TEST_F(DurableDeleteJournalTest, MoreThanTenThousandKeysSurviveRestart) {
+    {
+        DurableDeleteJournal journal(path);
+        for (size_t i = 0; i < 10001; ++i) {
+            ASSERT_TRUE(journal.Commit(
+                {"tenant", std::to_string(i), "operation", false, "scope-a"}));
+        }
+    }
+    DurableDeleteJournal journal(path);
+    ASSERT_EQ(journal.Records().size(), 10001);
+    EXPECT_TRUE(
+        journal.Commit({"tenant", "10001", "operation", false, "scope-a"}));
 }
 
 TEST_F(DurableDeleteJournalTest, InvalidPathAndCompletionWithoutBeginRefused) {

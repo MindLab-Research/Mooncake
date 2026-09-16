@@ -251,12 +251,8 @@ TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
             }
             // The poisoned transport refuses further work without hanging.
             const auto rejected = engine.allocateBatchID(1);
-            ASSERT_TRUE(engine.submitTransfer(rejected, requests).ok());
-            {
-                TransferEngineOperationState state(engine, rejected, 1);
-                state.wait_for_completion();
-                EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
-            }
+            EXPECT_FALSE(engine.submitTransfer(rejected, requests).ok());
+            EXPECT_TRUE(engine.freeBatchID(rejected).ok());
             ASSERT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
         }
     }

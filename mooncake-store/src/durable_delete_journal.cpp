@@ -12,12 +12,10 @@
 
 namespace mooncake {
 namespace {
-// Bound canonical state; refuse additional keys instead of exhausting memory.
-// Permanent tombstones require an explicit generation/retention protocol before
-// they can be removed. No automatic tombstone expiry is safe.
-constexpr size_t kMaxKeys = 10000;
+// Tombstones are permanent. Do not impose a lifetime key-count ceiling.
+// Recovery streams the journal; capacity is provisioned as persistent metadata.
 constexpr size_t kMaxFieldBytes = 1024;
-constexpr size_t kMaxJournalBytes = 256 * 1024 * 1024;
+constexpr size_t kMaxRecordBytes = 4 * kMaxFieldBytes * 2 + 128;
 
 std::string Hex(const std::string& value) {
     constexpr char digits[] = "0123456789abcdef";
@@ -106,28 +104,36 @@ DurableDeleteJournal::~DurableDeleteJournal() {
 }
 
 void DurableDeleteJournal::Replay() {
-    struct stat status{};
-    if (fstat(fd_, &status) || status.st_size < 0 ||
-        static_cast<size_t>(status.st_size) > kMaxJournalBytes) {
-        throw std::runtime_error("Deletion journal exceeds recovery bound");
-    }
-    std::string bytes(static_cast<size_t>(status.st_size), '\0');
-    size_t pos = 0;
-    while (pos < bytes.size()) {
-        const auto n = pread(fd_, bytes.data() + pos, bytes.size() - pos, pos);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error("Cannot read deletion journal");
-        pos += n;
-    }
-    pos = 0;
-    while (pos < bytes.size()) {
-        const auto end = bytes.find('\n', pos);
-        // Do not guess whether a damaged tail was acknowledged. Operator
-        // repair is preferable to silently losing a durable fence.
-        if (end == std::string::npos) {
-            throw std::runtime_error("Incomplete deletion journal record");
+    off_t pos = 0;
+    std::string pending;
+    bool eof = false;
+    while (true) {
+        auto end = pending.find('\n');
+        while (end == std::string::npos && !eof) {
+            char chunk[4096];
+            const auto n =
+                pread(fd_, chunk, sizeof(chunk), pos + pending.size());
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) throw std::runtime_error("Cannot read deletion journal");
+            eof = n == 0;
+            pending.append(chunk, n);
+            end = pending.find('\n');
+            if (end == std::string::npos && pending.size() > kMaxRecordBytes)
+                throw std::runtime_error("Deletion journal record too large");
         }
-        const auto line = bytes.substr(pos, end - pos + 1);
+        if (pending.empty()) break;
+        // Only an incomplete final append is recoverable. Commit never
+        // acknowledges it. Complete malformed records still fail closed.
+        if (end == std::string::npos) {
+            if (ftruncate(fd_, pos) != 0 || fsync(fd_) != 0)
+                throw std::runtime_error(
+                    "Cannot persist journal tail recovery");
+            break;
+        }
+        if (end + 1 > kMaxRecordBytes)
+            throw std::runtime_error("Deletion journal record too large");
+        const auto line = pending.substr(0, end + 1);
+        pending.erase(0, end + 1);
         std::istringstream input(line);
         std::string version, tenant, key, operation, phase, scope, checksum,
             extra;
@@ -152,7 +158,7 @@ void DurableDeleteJournal::Replay() {
         const auto identity = std::make_pair(record.tenant, record.key);
         auto old = records_.find(identity);
         if (old == records_.end()) {
-            if (record.completed || records_.size() >= kMaxKeys) {
+            if (record.completed) {
                 throw std::runtime_error("Invalid deletion journal admission");
             }
         } else if (old->second.operation != record.operation ||
@@ -163,7 +169,7 @@ void DurableDeleteJournal::Replay() {
             throw std::runtime_error("Conflicting deletion journal operation");
         }
         records_[identity] = std::move(record);
-        pos = end + 1;
+        pos += end + 1;
     }
 }
 
@@ -173,7 +179,7 @@ bool DurableDeleteJournal::Commit(const Record& record) {
     const auto identity = std::make_pair(record.tenant, record.key);
     auto old = records_.find(identity);
     if (old == records_.end()) {
-        if (record.completed || records_.size() >= kMaxKeys) return false;
+        if (record.completed) return false;
     } else {
         if (old->second.operation != record.operation ||
             old->second.namespace_identity != record.namespace_identity ||
@@ -183,11 +189,6 @@ bool DurableDeleteJournal::Commit(const Record& record) {
         if (old->second.completed == record.completed) return true;
     }
     const auto line = Encode(record);
-    struct stat status{};
-    if (fstat(fd_, &status) || status.st_size < 0 ||
-        static_cast<size_t>(status.st_size) + line.size() > kMaxJournalBytes) {
-        return false;
-    }
     size_t written = 0;
     while (written < line.size()) {
         const auto n = write(fd_, line.data() + written, line.size() - written);
