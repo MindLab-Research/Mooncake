@@ -108,6 +108,112 @@ TEST_F(TransferTaskTest,
     EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
 }
 
+// Fault injection models unsupported cancellation, a stuck abort, and a
+// stuck/failed status query without requiring RDMA hardware. It deliberately
+// never publishes physical completion. These are process-containment tests,
+// not claims that a hardware transport implements a cancellation barrier.
+class UncancellableTransport : public Transport {
+   public:
+    explicit UncancellableTransport(int mode) : mode_(mode) {}
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::OK();
+    }
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        if (mode_ == 2)
+            for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (mode_ == 3)
+            return Status::InvalidArgument("injected query failure");
+        status.s = TransferStatusEnum::TIMEOUT;
+        return Status::OK();
+    }
+    Status abortBatch(BatchID) override {
+        if (mode_ == 1)
+            for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+        return Status::NotImplemented("injected unsupported abort");
+    }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+    const char* getName() const override { return "uncancellable-test"; }
+    int mode_;
+};
+
+TEST_F(TransferTaskTest, SupervisedDeadlineExitsWithoutUnwindingActiveBuffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int mode : {0, 1, 2, 3}) {
+        EXPECT_EXIT(
+            {
+                alarm(5);  // A broken watchdog must fail instead of hanging CI.
+                ScopedEnvVar fatal("MC_STORE_TRANSFER_FATAL_TIMEOUT", "1");
+                ScopedEnvVar timeout("MC_STORE_TRANSFER_TIMEOUT_MS", "20");
+                ScopedEnvVar grace("MC_STORE_TRANSFER_ABORT_GRACE_MS", "100");
+                TransferEngine engine(false);
+                if (engine.init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0))
+                    std::_Exit(80);
+                if (engine.isUsingTent()) std::_Exit(81);
+                UncancellableTransport transport(mode);
+                const auto id = engine.allocateBatchID(1);
+                auto& batch = Transport::toBatchDesc(id);
+                batch.task_list.resize(1);
+                batch.task_list[0].batch_id = id;
+                batch.task_list[0].slice_count = 1;
+                batch.task_list[0].transport_ = &transport;
+                struct CallerBuffer {
+                    ~CallerBuffer() { std::_Exit(77); }
+                } caller_buffer;
+                auto state = std::make_shared<TransferEngineOperationState>(
+                    engine, id, 1);
+                TransferFuture future(state);
+                future.wait();
+                std::_Exit(78);  // Returning with active I/O is not safe.
+            },
+            ::testing::ExitedWithCode(124), "");
+    }
+}
+
+TEST_F(TransferTaskTest, SupervisedDeadlineDisarmsAfterPhysicalCompletion) {
+    ScopedEnvVar fatal("MC_STORE_TRANSFER_FATAL_TIMEOUT", "1");
+    ScopedEnvVar timeout("MC_STORE_TRANSFER_TIMEOUT_MS", "10");
+    ScopedEnvVar grace("MC_STORE_TRANSFER_ABORT_GRACE_MS", "1000");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+    if (engine.isUsingTent()) GTEST_SKIP() << "Legacy batch state test";
+    const auto id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(id);
+    batch.task_list.resize(1);
+    auto& task = batch.task_list[0];
+    task.batch_id = id;
+    task.slice_count = 1;
+    task.total_bytes = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 1;
+    TransferEngineOperationState state(engine, id, 1);
+    std::thread transfer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        slice.markSuccess();
+    });
+    state.wait_for_completion();
+    transfer.join();
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // A completed batch may be waited again after its original deadline.
+    state.wait_for_completion();
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
 // A real TCP peer that accepts connections and never sends a response. It
 // remains alive beyond the Store deadline, so peer teardown cannot pass the
 // test accidentally. Late bytes are sent only after both callers returned.

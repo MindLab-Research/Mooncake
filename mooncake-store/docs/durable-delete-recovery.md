@@ -14,7 +14,13 @@ Abort 撤销 upload ID，已中止的 ID 不能再次 Complete。若 Complete �
 
 取消仍先停止并 join 旧 I/O 执行器，完成所有在途 batch 的失败通知，再销毁旧 context 和回调。恢复创建全新的执行器并绑定原端口，不运行旧回调。关闭连接池的请求也使用受跟踪的异步队列，但每次成功后关闭连接，避免同步 DNS/connect 阻挡取消。新请求与恢复串行，旧 batch 的重复取消不会停止新一代请求。
 
-本轮测试范围为 TCP。非 TCP/Tent 缺少物理取消屏障时仍不能安全释放调用方内存；此项仍是单独的合并阻断，不把 TIMEOUT 枚举或一次失败的状态查询当作内存可回收证明。
+非 TCP/Tent 缺少物理取消屏障时不能安全返回调用方。托管的 provider/sidecar 可显式设置 `MC_STORE_TRANSFER_FATAL_TIMEOUT=1`：`wait()` 在第一次状态查询前启动独立 watchdog，在传输期限后加 `MC_STORE_TRANSFER_ABORT_GRACE_MS`（默认 5000 ms）的宽限期。未确认完成时调用 `_Exit(124)`，不执行析构、atexit 或日志锁，不释放活动缓冲区后继续运行。watchdog 独立于状态查询和 abort；它们本身阻塞也不能阻挡进程退出。若开始等待时传输期限已过，仍给予完整宽限期以检查完成状态。
+
+这是进程级故障隔离，不声称 RDMA/Tent 获得了物理取消 API，也不保证已发往远端的写被撤回。并发请求一起失败；写入响应丢失属于结果不确定，必须依靠既有幂等/删除围栏协调，不能当作未写入。进程退出后由操作系统回收本地执行上下文；不要在同进程中捕获超时再回收活动内存。通用库默认不启用退出策略。
+
+只在独立受托管的 Store 进程启用，不对内嵌训练主进程默认注入。容器应使用 `restart: on-failure` 或 Kubernetes `restartPolicy: Always`，保留终止 exit code 和日志，设置重启退避及告警。provider 重启后重新发现 segment/offload endpoint，更新 sidecar 配置并重建；仅原地重启旧配置的 sidecar 不足以恢复动态路由。共享 Master 及持久 journal 不随 regional Store 重建。
+
+该期限覆盖 Store 原生 batch `wait()`，不等于所有 SDK、OSS HTTP 或进程启动都有相同的端到端期限；外层 RPC 还应有独立 deadline。单独轮询 `isReady()` 不启动此 watchdog。
 
 ## journal 恢复
 

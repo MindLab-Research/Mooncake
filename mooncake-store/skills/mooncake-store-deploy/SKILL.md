@@ -11,7 +11,7 @@ description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生�
 
 记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。历史 live 验收绑定的运行源码为 Mooncake `a8657c7397ac23ec37550d9d5487026010041ab2`、Mint `90913210df556196f8ae51f86dac4e277b2e8c7f`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
 
-原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前非 TCP/Tent 有界取消、新候选两地 live 验收和镜像绑定尚未全部关闭，不得将历史 PASS 当作当前候选的生产放行依据。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
+原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前采用显式启用的非 TCP/Tent 进程隔离恢复；新候选两地 live 验收和镜像绑定尚未全部关闭，不得将历史 PASS 当作当前候选的生产放行依据。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
 
 每个节点必须能够访问同一个 Master RPC 和 HTTP metadata 服务；Master/客户端也必须能回连 provider offload RPC、Transfer Engine 和 TCP 数据端口。只通 50481 不够。动态端口要使用可双向路由的专网地址或测试 overlay；不要将公网任意端口全部开放。
 
@@ -92,7 +92,7 @@ python scripts/read_probe.py --config node.toml \
 - metadata 超时：检查双向网络和实际进程环境。本次 WAN provider/sidecar 使用 `MC_METADATA_HTTP_CONNECT_TIMEOUT_MS=10000`、`MC_METADATA_HTTP_TIMEOUT_MS=30000`，上游默认仍为 1500/3000 ms。OSS accelerate 只加速对象访问，不会自动加速 Master RPC 或 SSH。
 - 源端停止后短暂旧 RAM route：记录即时失败及 client_ttl 收敛后的结果，不能静默重试后只报成功。
 - TCP 原生传输卡住：当前库在 `MC_STORE_TRANSFER_TIMEOUT_MS`（默认 60000 ms）期限后终止 TCP I/O 并 join，确认不再触碰缓冲区才返回失败。同一旧执行器上的并发调用也会失败；新修复会销毁旧回调并在原端口创建全新 TCP 执行器，同一 Client 可继续新请求。若资源不足或重新绑定失败，transport 保持不可用。health 为 `HC_TRANSFER_UNAVAILABLE=3`，原生客户端显式启动 HTTP server 后的 `/health` 返回 503/`transfer_unavailable` 时，编排层应撤销 readiness 并重建受影响客户端/sidecar；进程未退出不代表健康。provider 同样受损时先恢复 provider，再重新获取 endpoint/segment 并启动 sidecar。不对同一失效客户端无限重试。
-- 非 TCP/Tent 尚未实现有界安全取消，此审查阻断不能靠缩短 timeout 关闭；Store deadline 也不是所有网络/metadata 阶段的端到端 SLA。
+- 非 TCP/Tent 不支持物理取消时使用下述托管进程退出/重启策略；不能以缩短 timeout 后直接释放内存代替。Store deadline 不是所有网络/metadata 阶段的端到端 SLA。
 
 ## 开发基准与生产接入
 
@@ -105,3 +105,7 @@ python scripts/read_probe.py --config node.toml \
 交付物包含节点无密钥配置、启动/回滚命令、版本 manifest、两方向原始读写/冷读/删除日志、token/S3 结果和时延定义。开发验收通过后交人工审核 PR，再安排生产部署；skill 不隐含合并或生产变更授权。
 
 Mint 仓库中的配置模板、固定依赖和活体测试入口见 [Mint 验证入口](references/mint-validation.md)。
+
+### 无法取消的托管传输
+
+独立 provider/sidecar 启用 `MC_STORE_TRANSFER_FATAL_TIMEOUT=1`、`MC_STORE_TRANSFER_ABORT_GRACE_MS=5000`，并配置失败自动重启。原生 batch 等待超时后仍无物理停止证明时进程退出 124，不执行析构；同进程并发请求也失败。通用库默认不启用，禁止默认注入内嵌训练进程。该策略不撤回已到达远端的写，不把请求失败等同于对象不存在。provider 重启后必须重取 segment/offload endpoint 并更新 sidecar，共享 Master/journal 不重建。故障测试需保存 exit code、重启次数、新进程 ID 和恢复后的真实读取。详见 [协议与恢复说明](../../docs/durable-delete-recovery.md)。

@@ -59,7 +59,12 @@ export MC_TCP_BIND_ADDRESS=<NODE_ROUTABLE_IP>
 export MC_METADATA_HTTP_CONNECT_TIMEOUT_MS=10000
 export MC_METADATA_HTTP_TIMEOUT_MS=30000
 export MC_STORE_TRANSFER_TIMEOUT_MS=60000
+# 仅向受托管的独立 provider/sidecar 注入，超时无法 drain 时退出 124。
+export MC_STORE_TRANSFER_FATAL_TIMEOUT=1
+export MC_STORE_TRANSFER_ABORT_GRACE_MS=5000
 ```
+
+服务必须配置失败重启（Docker `--restart=on-failure` / Kubernetes `restartPolicy: Always`），记录 exit 124 并对重复重启告警。provider 重启后重新发现 endpoint/segment，再更新并重建 sidecar，不能一直使用上一代动态地址。共享 Master 保持独立。该退出策略只覆盖原生 batch 等待，不替代外层 RPC 和 OSS HTTP deadline。
 
 provider 的服务管理器加载上述公共环境和 provider 专属文件，然后执行：
 

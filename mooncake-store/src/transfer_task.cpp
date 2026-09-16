@@ -39,6 +39,51 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
+// Opt-in process containment for supervised Store clients. The timer is
+// independent of the polling/abort thread: either operation may itself hang.
+// Never unwind caller buffers when native I/O has no quiescence barrier.
+class TransferProcessDeadline {
+   public:
+    explicit TransferProcessDeadline(
+        std::chrono::steady_clock::time_point deadline) {
+        const char* mode = std::getenv("MC_STORE_TRANSFER_FATAL_TIMEOUT");
+        if (!mode || std::strcmp(mode, "1") != 0) return;
+        try {
+            worker_ = std::thread([this, deadline] {
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (cv_.wait_until(lock, deadline,
+                                   [this] { return completed_; }))
+                    return;
+                // Avoid logging locks, atexit handlers and destructors, any of
+                // which can deadlock or release memory still used by native
+                // I/O. Exit 124 identifies a supervised native-transfer
+                // timeout.
+                std::_Exit(124);
+            });
+        } catch (...) {
+            // A supervised process must not silently lose its safety timer.
+            std::_Exit(124);
+        }
+    }
+    ~TransferProcessDeadline() {
+        if (!worker_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            completed_ = true;
+        }
+        cv_.notify_one();
+        worker_.join();
+    }
+    TransferProcessDeadline(const TransferProcessDeadline&) = delete;
+    TransferProcessDeadline& operator=(const TransferProcessDeadline&) = delete;
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool completed_ = false;
+    std::thread worker_;
+};
+
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
@@ -865,6 +910,10 @@ void TransferEngineOperationState::wait_for_completion() {
     const auto deadline =
         start_time_ + std::chrono::milliseconds(GetPositiveEnvOrDefault(
                           "MC_STORE_TRANSFER_TIMEOUT_MS", 60 * 1000));
+    TransferProcessDeadline process_deadline(
+        std::max(deadline, std::chrono::steady_clock::now()) +
+        std::chrono::milliseconds(
+            GetPositiveEnvOrDefault("MC_STORE_TRANSFER_ABORT_GRACE_MS", 5000)));
     while (true) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -899,9 +948,8 @@ TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
 bool TransferFuture::isReady() const { return state_->is_completed(); }
 
 ErrorCode TransferFuture::wait() {
-    if (!isReady()) {
-        state_->wait_for_completion();
-    }
+    // Arm the supervised deadline before the first native status query.
+    state_->wait_for_completion();
     return state_->get_result();
 }
 
