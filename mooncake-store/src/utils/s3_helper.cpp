@@ -977,6 +977,50 @@ tl::expected<void, S3RequestError> S3Helper::UploadBytes(
 
 tl::expected<void, S3RequestError> S3Helper::UploadSlices(
     const std::string &key, const std::vector<std::span<const char>> &slices) {
+    return UploadSlicesImpl(key, slices, std::nullopt);
+}
+
+tl::expected<std::string, S3RequestError> S3Helper::CreateUpload(
+    const std::string &key) {
+    Aws::S3::Model::CreateMultipartUploadRequest request;
+    request.SetBucket(bucket_.c_str());
+    request.SetKey(key.c_str());
+    auto outcome = s3_client_.CreateMultipartUpload(request);
+    if (!outcome.IsSuccess())
+        return tl::make_unexpected(ClassifyS3Error(outcome.GetError()));
+    std::string id = outcome.GetResult().GetUploadId().c_str();
+    if (id.empty() || id.size() > 4096 ||
+        id.find_first_of("\r\n") != std::string::npos)
+        return tl::make_unexpected(
+            InvalidS3Response("Invalid multipart upload ID"));
+    return id;
+}
+
+tl::expected<void, S3RequestError> S3Helper::AbortUpload(
+    const std::string &key, const std::string &upload_id) {
+    Aws::S3::Model::AbortMultipartUploadRequest request;
+    request.SetBucket(bucket_.c_str());
+    request.SetKey(key.c_str());
+    request.SetUploadId(upload_id.c_str());
+    auto outcome = s3_client_.AbortMultipartUpload(request);
+    if (outcome.IsSuccess() ||
+        outcome.GetError().GetExceptionName() == "NoSuchUpload")
+        return {};
+    return tl::make_unexpected(ClassifyS3Error(outcome.GetError()));
+}
+
+tl::expected<void, S3RequestError> S3Helper::UploadAdmittedSlices(
+    const std::string &key, const std::string &upload_id,
+    const std::vector<std::span<const char>> &slices) {
+    if (upload_id.empty())
+        return tl::make_unexpected(
+            InvalidS3Response("Missing admitted upload ID"));
+    return UploadSlicesImpl(key, slices, upload_id);
+}
+
+tl::expected<void, S3RequestError> S3Helper::UploadSlicesImpl(
+    const std::string &key, const std::vector<std::span<const char>> &slices,
+    const std::optional<std::string> &admitted_upload) {
     constexpr size_t part_size = 32UL << 20;
     size_t total = 0;
     for (const auto slice : slices) {
@@ -1024,7 +1068,7 @@ tl::expected<void, S3RequestError> S3Helper::UploadSlices(
         }
         return staging.data();
     };
-    if (total <= part_size) {
+    if (!admitted_upload && total <= part_size) {
         Aws::Utils::Stream::PreallocatedStreamBuf buffer(next_part(total),
                                                          total);
         Aws::S3::Model::PutObjectRequest request;
@@ -1038,13 +1082,12 @@ tl::expected<void, S3RequestError> S3Helper::UploadSlices(
         return {};
     }
 
-    Aws::S3::Model::CreateMultipartUploadRequest create;
-    create.SetBucket(bucket_.c_str());
-    create.SetKey(key.c_str());
-    auto created = s3_client_.CreateMultipartUpload(create);
-    if (!created.IsSuccess())
-        return tl::make_unexpected(ClassifyS3Error(created.GetError()));
-    const auto upload_id = created.GetResult().GetUploadId();
+    auto created =
+        admitted_upload
+            ? tl::expected<std::string, S3RequestError>(*admitted_upload)
+            : CreateUpload(key);
+    if (!created) return tl::make_unexpected(created.error());
+    const Aws::String upload_id(created->c_str());
     struct AbortGuard {
         Aws::S3::S3Client &client;
         Aws::S3::Model::AbortMultipartUploadRequest request;
@@ -1060,7 +1103,7 @@ tl::expected<void, S3RequestError> S3Helper::UploadSlices(
     guard.request.SetUploadId(upload_id);
     Aws::S3::Model::CompletedMultipartUpload completed;
     int part_number = 1;
-    for (size_t offset = 0; offset < total;
+    for (size_t offset = 0; offset < std::max<size_t>(total, 1);
          offset += part_size, ++part_number) {
         const auto length = std::min(part_size, total - offset);
         Aws::Utils::Stream::PreallocatedStreamBuf buffer(next_part(length),

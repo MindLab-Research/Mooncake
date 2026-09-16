@@ -68,7 +68,15 @@ class S3ObjectStorageAdapter final : public ObjectStorageAdapter {
     tl::expected<void, ErrorCode> CheckNotDeleted(const std::string& key);
     tl::expected<void, ErrorCode> FinishUpload(const std::string& key);
     std::string WriterPrefix(const std::string& key) const;
-    tl::expected<std::string, ErrorCode> BeginUpload(const std::string& key);
+    struct UploadAdmission {
+        std::string marker;
+        std::string upload_id;
+    };
+    tl::expected<UploadAdmission, ErrorCode> BeginUpload(
+        const std::string& key);
+    tl::expected<void, ErrorCode> UploadSlices(
+        const std::string& key,
+        const std::vector<std::span<const char>>& slices);
     tl::expected<void, ErrorCode> ReleaseUpload(const std::string& writer);
 
     const S3ObjectStorageConfig config_;

@@ -1,5 +1,6 @@
 #include "storage/distributed/s3_object_storage_adapter.h"
 
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -140,20 +141,27 @@ tl::expected<std::string, ErrorCode> S3ObjectStorageAdapter::PhysicalKey(
 
 tl::expected<void, ErrorCode> S3ObjectStorageAdapter::Put(
     const std::string& key, std::span<const char> data) {
+    return UploadSlices(key, {data});
+}
+
+tl::expected<void, ErrorCode> S3ObjectStorageAdapter::UploadSlices(
+    const std::string& key, const std::vector<std::span<const char>>& slices) {
     if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     auto physical = PhysicalKey(key);
     if (!physical) return tl::make_unexpected(physical.error());
     auto writer = BeginUpload(key);
     if (!writer) return tl::make_unexpected(writer.error());
-    auto result = helper_->UploadBytes(*physical, data);
-    // Even an error can follow a committed upload (for example a lost reply).
-    // Reconcile a concurrent permanent intent before returning to the writer.
+    auto result =
+        helper_->UploadAdmittedSlices(*physical, writer->upload_id, slices);
+    // An error can be a lost Complete reply. Obtain a server-side fence
+    // before removing admission: a delayed writer can no longer publish.
+    if (!result) {
+        auto aborted = helper_->AbortUpload(*physical, writer->upload_id);
+        if (!aborted) return tl::make_unexpected(MapError(aborted.error()));
+    }
     auto finalized = FinishUpload(key);
-    // A failed upload may still be executing remotely. Its durable admission
-    // is never expired or removed just because this process saw an error.
-    if (result &&
-        (finalized || finalized.error() == ErrorCode::FILE_NOT_FOUND)) {
-        auto released = ReleaseUpload(*writer);
+    if (finalized || finalized.error() == ErrorCode::FILE_NOT_FOUND) {
+        auto released = ReleaseUpload(writer->marker);
         if (!released) return released;
     }
     if (!finalized) return finalized;
@@ -168,25 +176,35 @@ std::string S3ObjectStorageAdapter::WriterPrefix(const std::string& key) const {
            std::string(Aws::Utils::HashingUtils::HexEncode(digest)) + "/";
 }
 
-tl::expected<std::string, ErrorCode> S3ObjectStorageAdapter::BeginUpload(
-    const std::string& key) {
-    const auto writer = WriterPrefix(key) + UuidToString(generate_uuid());
-    if (writer.size() > 1024)
+tl::expected<S3ObjectStorageAdapter::UploadAdmission, ErrorCode>
+S3ObjectStorageAdapter::BeginUpload(const std::string& key) {
+    const auto marker = WriterPrefix(key) + UuidToString(generate_uuid());
+    auto physical = PhysicalKey(key);
+    if (!physical) return tl::make_unexpected(physical.error());
+    if (marker.size() > 1024)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    constexpr char admission[] = "mooncake-upload-admission-v1";
-    auto registered = helper_->UploadBytes(
-        writer, std::span<const char>(admission, sizeof(admission) - 1));
-    if (!registered) return tl::make_unexpected(MapError(registered.error()));
-    // Admission must exist before checking the permanent fence. With strongly
-    // consistent LIST/HEAD, a deleter either sees this writer or this writer
-    // sees the fence before sending data. No timed lease can prove IO stopped.
+    auto upload = helper_->CreateUpload(*physical);
+    if (!upload) return tl::make_unexpected(MapError(upload.error()));
+    const auto body =
+        std::string("mooncake-multipart-admission-v2\n") + *upload;
+    auto registered = helper_->UploadBytes(marker, std::span<const char>(body));
+    if (!registered) {
+        // No part/complete has been issued. Even if the marker PUT arrives
+        // late, its upload ID is abortable by a later delete retry.
+        (void)helper_->AbortUpload(*physical, *upload);
+        return tl::make_unexpected(MapError(registered.error()));
+    }
+    // Strongly consistent LIST/HEAD: either deletion sees admission, or this
+    // check sees deletion before any data/complete request is issued.
     auto visible = CheckNotDeleted(key);
     if (!visible) {
-        auto released = ReleaseUpload(writer);  // No data request was issued.
+        auto aborted = helper_->AbortUpload(*physical, *upload);
+        if (!aborted) return tl::make_unexpected(MapError(aborted.error()));
+        auto released = ReleaseUpload(marker);
         if (!released) return tl::make_unexpected(released.error());
         return tl::make_unexpected(visible.error());
     }
-    return writer;
+    return UploadAdmission{marker, *upload};
 }
 
 tl::expected<void, ErrorCode> S3ObjectStorageAdapter::ReleaseUpload(
@@ -222,8 +240,31 @@ tl::expected<void, ErrorCode> S3ObjectStorageAdapter::MarkDeletion(
     if (!result) return tl::make_unexpected(MapError(result.error()));
     auto writers = helper_->ListObjectsV2Detailed(WriterPrefix(key));
     if (!writers) return tl::make_unexpected(MapError(writers.error()));
-    if (!writers->empty())
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto physical = PhysicalKey(key);
+    if (!physical) return tl::make_unexpected(physical.error());
+    for (const auto& writer : *writers) {
+        std::array<char, 8192> content;
+        auto read =
+            helper_->DownloadBytes(writer.key, content.data(), content.size());
+        if (!read) {
+            if (read.error().kind == S3RequestErrorKind::kNotFound) continue;
+            return tl::make_unexpected(MapError(read.error()));
+        }
+        const std::string_view body(content.data(), *read);
+        constexpr std::string_view version =
+            "mooncake-multipart-admission-v2\n";
+        // Legacy raw-PUT admission has no revocable server capability. Never
+        // expire it heuristically; mixed-version rollout must drain it first.
+        if (!body.starts_with(version) || body.size() <= version.size() ||
+            body.size() > version.size() + 4096)
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        auto aborted = helper_->AbortUpload(
+            *physical, std::string(body.substr(version.size())));
+        if (!aborted) return tl::make_unexpected(MapError(aborted.error()));
+        auto released = ReleaseUpload(writer.key);
+        if (!released) return released;
+    }
     return {};
 }
 
@@ -281,18 +322,7 @@ tl::expected<void, ErrorCode> S3ObjectStorageAdapter::PutV(
             slices.emplace_back(static_cast<const char*>(iov[i].iov_base),
                                 iov[i].iov_len);
     }
-    auto writer = BeginUpload(key);
-    if (!writer) return tl::make_unexpected(writer.error());
-    auto result = helper_->UploadSlices(*physical, slices);
-    auto finalized = FinishUpload(key);
-    if (result &&
-        (finalized || finalized.error() == ErrorCode::FILE_NOT_FOUND)) {
-        auto released = ReleaseUpload(*writer);
-        if (!released) return released;
-    }
-    if (!finalized) return finalized;
-    if (!result) return tl::make_unexpected(MapError(result.error()));
-    return {};
+    return UploadSlices(key, slices);
 }
 
 tl::expected<size_t, ErrorCode> S3ObjectStorageAdapter::Get(

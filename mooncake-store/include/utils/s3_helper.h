@@ -113,6 +113,14 @@ class S3Helper {
     tl::expected<void, S3RequestError> UploadSlices(
         const std::string &key,
         const std::vector<std::span<const char>> &slices);
+    // Durable writer admission binds a server-side multipart capability.
+    tl::expected<std::string, S3RequestError> CreateUpload(
+        const std::string &key);
+    tl::expected<void, S3RequestError> AbortUpload(
+        const std::string &key, const std::string &upload_id);
+    tl::expected<void, S3RequestError> UploadAdmittedSlices(
+        const std::string &key, const std::string &upload_id,
+        const std::vector<std::span<const char>> &slices);
     tl::expected<size_t, S3RequestError> DownloadBytes(const std::string &key,
                                                        void *buffer,
                                                        size_t capacity);
@@ -125,6 +133,10 @@ class S3Helper {
     ListObjectsV2Detailed(const std::string &prefix);
 
    private:
+    tl::expected<void, S3RequestError> UploadSlicesImpl(
+        const std::string &key,
+        const std::vector<std::span<const char>> &slices,
+        const std::optional<std::string> &admitted_upload);
     Aws::S3::S3Client s3_client_;
     std::string bucket_;
     std::string connection_info_;

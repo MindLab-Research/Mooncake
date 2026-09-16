@@ -647,6 +647,83 @@ static void AdapterTest() {
               << capability->max_scoped_key_bytes << "}" << std::endl;
 }
 
+static void MultipartAdmissionTest(bool abort_denied = false) {
+    auto config = S3ObjectStorageConfig::FromEnvironment();
+    Require(config.endpoint.starts_with("http://127.0.0.1:") ||
+                (config.endpoint.starts_with("https://") &&
+                 config.endpoint.ends_with(".aliyuncs.com") &&
+                 config.key_prefix.starts_with("ctgg-review-5221305272/")),
+            "multipart admission requires an isolated fixture namespace");
+    S3ObjectStorageAdapter adapter(config);
+    Require(adapter.Init().has_value(), "adapter init");
+    S3Helper physical(config.endpoint, config.bucket, config.region);
+    const std::vector<char> payload(1024, 'p');
+    for (const bool completed : {false, true}) {
+        const std::string key = completed ? "complete-crash" : "admitted-crash";
+        std::string encoded;
+        for (unsigned char c : key) {
+            constexpr char hex[] = "0123456789abcdef";
+            encoded += hex[c >> 4];
+            encoded += hex[c & 15];
+        }
+        const auto object = config.key_prefix + "/objects/" + encoded;
+        const auto marker = config.key_prefix + "/writers/" +
+                            Hash(std::vector<char>(key.begin(), key.end())) +
+                            "/test-crash";
+        Require(adapter.Put(key, payload).has_value(), "initial object");
+        auto id = physical.CreateUpload(object);
+        Require(id.has_value(), "create upload capability");
+        const auto body =
+            std::string("mooncake-multipart-admission-v2\n") + *id;
+        Require(physical.UploadBytes(marker, std::span<const char>(body))
+                    .has_value(),
+                "persist admission before any payload");
+        if (abort_denied) {
+            Require(!adapter.MarkDeletion(key), "abort denial propagates");
+            auto object_exists = physical.ObjectExists(object);
+            auto marker_exists = physical.ObjectExists(marker);
+            Require(object_exists && *object_exists,
+                    "denied abort retains data");
+            Require(marker_exists && *marker_exists,
+                    "denied abort retains admission");
+            std::cout << "MULTIPART_ABORT_DENIED_PASS" << std::endl;
+            return;
+        }
+        if (completed)
+            Require(physical.UploadAdmittedSlices(object, *id, {payload})
+                        .has_value(),
+                    "complete before simulated lost reply/crash");
+        // Recreate the adapter: no in-memory writer ownership or timer remains.
+        S3ObjectStorageAdapter recovered(config);
+        Require(recovered.Init().has_value(), "restart adapter");
+        std::atomic<int> successes{0};
+        std::vector<std::thread> deleters;
+        for (int n = 0; n < 8; ++n)
+            deleters.emplace_back([&] {
+                if (recovered.MarkDeletion(key) && recovered.Delete(key))
+                    ++successes;
+            });
+        for (auto& thread : deleters) thread.join();
+        Require(successes == 8,
+                "all concurrent orphan recovery deletes succeed");
+        auto exists = physical.ObjectExists(object);
+        Require(exists && !*exists, "physical object removed");
+        auto admission = physical.ObjectExists(marker);
+        Require(admission && !*admission, "orphan admission removed");
+        Require(!physical.UploadAdmittedSlices(object, *id, {payload}),
+                "late writer cannot publish with revoked upload ID");
+        exists = physical.ObjectExists(object);
+        Require(exists && !*exists, "late upload does not resurrect bytes");
+        Require(!recovered.Put(key, payload),
+                "new admission observes permanent fence");
+    }
+    // Forced multipart must preserve zero-length objects too.
+    Require(adapter.Put("empty", {}).has_value(), "empty multipart object");
+    auto empty = adapter.Exists("empty");
+    Require(empty && *empty, "empty object remains present");
+    std::cout << "MULTIPART_ADMISSION_PASS" << std::endl;
+}
+
 int main(int argc, char** argv) {
     ResourceTracker::getInstance();
     google::InitGoogleLogging(argv[0]);
@@ -721,6 +798,27 @@ int main(int argc, char** argv) {
                                            : ErrorCode::DFS_PERMISSION_DENIED),
                     "late writer propagates cleanup outcome");
             std::cout << "DELETION_RACE_PASS" << std::endl;
+            return 0;
+        }
+        if (mode == "multipart-abort-denied") {
+            MultipartAdmissionTest(true);
+            return 0;
+        }
+        if (mode == "multipart-retry") {
+            auto config = S3ObjectStorageConfig::FromEnvironment();
+            Require(config.endpoint.starts_with("http://127.0.0.1:"),
+                    "loopback retry fixture");
+            S3ObjectStorageAdapter adapter(config);
+            Require(adapter.Init().has_value(), "retry adapter init");
+            Require(adapter.MarkDeletion("admitted-crash").has_value(),
+                    "retry revokes writer");
+            Require(adapter.Delete("admitted-crash").has_value(),
+                    "retry removes bytes");
+            std::cout << "MULTIPART_RETRY_PASS" << std::endl;
+            return 0;
+        }
+        if (mode == "multipart-admission") {
+            MultipartAdmissionTest();
             return 0;
         }
         if (mode == "deletion-intent") {
