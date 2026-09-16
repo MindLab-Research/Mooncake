@@ -7,6 +7,10 @@ description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生�
 
 用于单 authoritative Master、每个业务节点或地域部署 Store/provider 的接入。Master 管对象元数据和路由；对象字节由 Store/provider 与 OSS 交换，不经过 Master。Mint 经 sidecar/C ABI 访问 Store，不直接持有 OSS 凭据。
 
+## 交付状态与使用方式
+
+本 skill 是部署和验收操作说明，不是已接入 Mint 生产编排的一键安装器。开发机单 Master、两地 Store 的存储门禁已通过；正式镜像仓库发布、生产服务配置，以及 provider 重启后的自动路由刷新和实际 GetBlob readiness 仍需在目标集群落实并演练。Docker 自动重启仅恢复进程，不能自动更新 sidecar 的动态 endpoint。不要把上述开发机 PASS 表述为生产发布已经完成。
+
 ## 先确定版本和网络
 
 记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。2026-09-16 最新开发机镜像 live 验收绑定的运行源码为 Mooncake `db65d41a4cac63ec055806922b15981aea1314a2`、Mint `aa9a1e67cbd2a740a2569b92a563cb7663d83d29`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
@@ -45,7 +49,7 @@ sidecar 的 `[store.mooncake]` 配置（preferred_segments 填本次 provider �
 ```toml
 master_server_addr = "<MASTER_IP>:50481"
 metadata_server = "http://<MASTER_IP>:28482/metadata"
-local_hostname = "<NODE_ROUTABLE_IP>:0"
+local_hostname = "<NODE_ROUTABLE_IP>:<UNIQUE_SIDECAR_ID_PORT>"
 protocol = "tcp"
 require_offload = true
 replica_num = 1

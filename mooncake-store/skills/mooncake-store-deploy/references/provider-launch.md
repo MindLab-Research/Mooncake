@@ -104,7 +104,7 @@ kind = "mooncake"
 [store.mooncake]
 master_server_addr = "<MASTER_IP>:50481"
 metadata_server = "http://<MASTER_IP>:28482/metadata"
-local_hostname = "<NODE_ROUTABLE_IP>:0"
+local_hostname = "<NODE_ROUTABLE_IP>:<UNIQUE_SIDECAR_ID_PORT>"
 protocol = "tcp"
 device_name = ""
 global_segment_size = 0
@@ -124,13 +124,15 @@ max_inflight_tar_ops = 4
 workers = 2
 ```
 
+`UNIQUE_SIDECAR_ID_PORT` 是同一可路由 IP 下为每个原生客户端分配的稳定唯一身份端口，例如 18638、18639；不是 sidecar gRPC 监听端口。不要让同机多副本或重叠的新旧进程复用此身份。
+
 本示例监听 loopback，适用于同节点 Mint。当前 sidecar 在配置解析和启动时强制 loopback。Kubernetes 中必须让调用它的 Mint API/业务进程与 sidecar 位于同一 Pod（共享网络命名空间）；普通独立 Pod 的 Service 地址方案不适用于当前二进制。provider 可独立部署，通过可路由地址与 sidecar/共享 Master 通信。Mint 调用此 sidecar，不获得 provider 的云凭据。真实训练资源与业务调度配置是独立接入步骤，本存储测试不证明 GPU 训练闭环。
 
 ## 常驻与故障恢复
 
 用 systemd 或集群原生编排分别管理唯一 Master 和 regional Store/sidecar。Master 不作为每个 Store 的子进程启动。provider 重启后重新发现 segment，并更新或重启其 sidecar；不能沿用旧 preferred_segments 或 MC_STORE_REQUIRED_OFFLOAD_ENDPOINT。只在当前 provider 的 readiness 通过后启动 sidecar。
 
-对本次开发环境，现成 unit 为 `ctgg-shared-mooncake-master`（北京）、`ctgg-mint-mooncake-oss`（两地）。升级时保存旧配置/运行目录；只切换 regional provider 和库无需重启 Master。回滚时同样恢复成对的 provider/库，保留 namespace 和 durable-delete journal；不删除 OSS 对象或 journal。
+不要依据历史开发环境的 systemd unit 名称判断当前部署。本次镜像验收使用独立 Docker 容器；当前进程、镜像与地址以随版本交付的 manifest 为准。生产服务名称由集群编排定义。升级时保存旧配置/运行目录；仅切换兼容的 regional provider 和库无需重启 Master。回滚时同样恢复成对的 provider/库，保留 namespace 和 durable-delete journal；不删除 OSS 对象或 journal。
 
 验收结束保留两地 Store 常驻。状态证据至少包括真实 PID、`/proc/PID/exe`、加载库、无凭据的配置摘要和双向冷读结果。若出现 metadata 超时、旧 RAM route 或后台反复重启，记录失败，不能以最终一次成功覆盖。
 
