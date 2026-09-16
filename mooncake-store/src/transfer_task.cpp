@@ -836,11 +836,27 @@ void TransferEngineOperationState::abort_timed_out_batch() {
                           task.transport_) == transports.end())
                 transports.push_back(task.transport_);
         }
+        bool quiesced =
+            !transports.empty() &&
+            std::all_of(
+                batch.task_list.begin(), batch.task_list.end(),
+                [](const auto& task) { return task.transport_ != nullptr; });
         for (auto* transport : transports) {
             auto status = transport->abortBatch(batch_id_);
-            if (!status.ok())
+            if (!status.ok()) {
+                quiesced = false;
                 LOG(ERROR) << "Cannot abort batch " << batch_id_ << ": "
                            << status.message() << "; retaining caller buffers";
+            }
+        }
+        if (quiesced) {
+            // Successful abort is the physical completion barrier. A broken
+            // status query after that must not strand an already drained RPC.
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Status polling normally sets this bookkeeping flag. The abort
+            // barrier also permits freeing a batch when polling itself fails.
+            for (auto& task : batch.task_list) task.is_finished = true;
+            if (!result_) set_result_internal(ErrorCode::TRANSFER_FAIL);
         }
     });
 }

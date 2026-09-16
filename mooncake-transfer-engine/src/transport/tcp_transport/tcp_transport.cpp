@@ -374,7 +374,9 @@ TcpTransport::TcpTransport()
 }
 
 Status TcpTransport::abortBatch(BatchID batch_id) {
-    // Never join an executor from one of its own threads.
+    // Serialize admission with runtime replacement, including pool-disabled
+    // requests. No callback acquires this mutex: joining cannot deadlock it.
+    std::lock_guard<std::mutex> lock(abort_mutex_);
     if (io_pool_) {
         for (size_t i = 0; i < io_pool_->size(); ++i) {
             if (io_pool_->executor(i).running_in_this_thread())
@@ -382,19 +384,36 @@ Status TcpTransport::abortBatch(BatchID batch_id) {
                     "TCP abort cannot run on its I/O executor");
         }
     }
-    std::lock_guard<std::mutex> lock(abort_mutex_);
-    shutdownConnectionLanes();
-    // shutdown joined every I/O thread. One-shot sessions (pool disabled) can
-    // still own unexecuted callbacks, but the stopped pool is never restarted.
-    // Publish failure for their slices only AFTER that quiescence barrier.
     auto& batch = toBatchDesc(batch_id);
-    for (auto& task : batch.task_list) {
+    bool pending = false;
+    for (const auto& task : batch.task_list) {
         if (task.transport_ != this) continue;
-        for (auto* slice : task.slice_list) {
-            if (slice->status != Slice::SUCCESS &&
-                slice->status != Slice::FAILED)
-                slice->markFailed();
-        }
+        const auto completed =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE) +
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (completed != task.slice_count) pending = true;
+    }
+    // Another cancellation may already have drained this generation. Never
+    // cancel new work just because a second waiter reached its old deadline.
+    if (!pending) return Status::OK();
+    shutdownConnectionLanes();
+    // Every request now uses a tracked lane, even without connection reuse.
+    // Destruct the old contexts, never restart them: queued callbacks can
+    // contain caller pointers whose batch is already terminal.
+    delete context_;
+    context_ = nullptr;
+    io_pool_.reset();
+    try {
+        startRuntime(tcp_port_);
+    } catch (const std::exception& e) {
+        running_ = false;
+        LOG(ERROR) << "TCP runtime recovery failed: " << e.what();
+        shutdownConnectionLanes();
+        delete context_;
+        context_ = nullptr;
+        io_pool_.reset();
+        // Cancellation still succeeded. The availability gate rejects new
+        // work if local resources prevent rebinding the same endpoint.
     }
     return Status::OK();
 }
@@ -450,6 +469,12 @@ int TcpTransport::install(std::string& local_server_name,
 
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
+    tcp_port_ = tcp_port;
+    startRuntime(tcp_port_);
+    return 0;
+}
+
+void TcpTransport::startRuntime(int tcp_port) {
     auto metadata = metadata_;
     io_pool_ = std::make_unique<TcpIoPool>(num_io_threads_);
     context_ = new TcpContext(
@@ -459,15 +484,11 @@ int TcpTransport::install(std::string& local_server_name,
         });
     lane_runtime_ = std::make_shared<ConnectionLaneRuntime>(*io_pool_);
     lane_state_->runtime = lane_runtime_;
-    running_ = true;
-    // Shard 0 owns the acceptor; arm (and re-arm after a restart) doAccept on
-    // its own thread. Other shards just drain their io_context.
+    lane_state_->shutting_down = false;
     io_pool_->start([this](size_t shard) {
         if (shard == 0) context_->doAccept();
     });
-    LOG(INFO) << "TcpTransport: I/O pool started with " << num_io_threads_
-              << " thread(s)";
-    return 0;
+    running_.store(true, std::memory_order_release);
 }
 
 int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
@@ -566,6 +587,8 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status TcpTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    std::lock_guard<std::mutex> lock(abort_mutex_);
+    if (!running_) return Status::NotSupportedTransport("TCP unavailable");
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
@@ -589,6 +612,8 @@ Status TcpTransport::submitTransfer(
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    std::lock_guard<std::mutex> lock(abort_mutex_);
+    if (!running_) return Status::NotSupportedTransport("TCP unavailable");
     for (size_t i = 0; i < task_list.size();) {
         auto* task = task_list[i];
         assert(task && task->request);
@@ -616,6 +641,8 @@ Status TcpTransport::submitTransferTask(
 
 Status TcpTransport::submitTransferTaskGroup(
     const std::vector<TransferTask*>& task_list) {
+    std::lock_guard<std::mutex> lock(abort_mutex_);
+    if (!running_) return Status::NotSupportedTransport("TCP unavailable");
     std::vector<Slice*> slices;
     slices.reserve(task_list.size());
     for (auto* task : task_list) {
@@ -711,26 +738,6 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     (*advance)();
 }
 
-std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
-    const std::string& host, uint16_t port) {
-    // The reusable path is owned by fixed connection lanes. This helper is
-    // only for the connection-pool-disabled one-shot path.
-    try {
-        asio::ip::tcp::resolver resolver(context_->io_context);
-        auto endpoint_iterator = resolver.resolve(host, std::to_string(port));
-        auto socket_ptr =
-            std::make_shared<asio::ip::tcp::socket>(context_->io_context);
-        asio::connect(*socket_ptr, endpoint_iterator);
-        socket_ptr->set_option(asio::ip::tcp::no_delay(true));
-        return socket_ptr;
-    } catch (std::exception& e) {
-        LOG(ERROR)
-            << "TcpTransport::getConnection failed to create connection to "
-            << host << ":" << port << ". Error: " << e.what();
-        return nullptr;
-    }
-}
-
 #include "tcp_transport_lane_impl.h"
 
 void TcpTransport::startTransfer(Slice* slice,
@@ -787,81 +794,10 @@ void TcpTransport::startTransfer(Slice* slice,
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
     TcpWorkItem work(slice, use_v2, std::move(continuation));
 
-    // Scatter task groups request reuse even when the general pool setting is
-    // disabled. Fixed lanes provide the same serial socket reuse without
-    // reviving the old unbounded dynamic pool.
-    if (enable_connection_pool_ || reuse_connection) {
-        enqueuePooledTransfer(desc->name, key, std::move(work));
-        return;
-    }
-
-    // Preserve the connection-pool-disabled synchronous one-shot path.
-    auto socket = getConnection(key.host, key.port);
-    if (!socket) {
-        LOG(ERROR) << "TcpTransport::startTransfer failed to get connection to "
-                   << key.host << ":" << key.port;
-        completeTerminalAction(
-            TerminalAction(std::move(work), TransferStatusEnum::FAILED, false));
-        return;
-    }
-    startTransferWithSocket(std::move(work), std::move(socket));
-}
-
-void TcpTransport::startTransferWithSocket(
-    TcpWorkItem work, std::shared_ptr<asio::ip::tcp::socket> socket) noexcept {
-    const Slice* slice = work.slice;
-    std::shared_ptr<std::optional<TcpWorkItem>> terminal_work;
-    try {
-        terminal_work =
-            std::make_shared<std::optional<TcpWorkItem>>(std::move(work));
-        auto session = std::make_shared<ClientSession>(
-            socket, terminal_work->value().use_v2,
-            [terminal_work, socket](TransferStatusEnum status, bool) noexcept {
-                closeSocketNoThrow(socket);
-                if (!terminal_work->has_value()) return;
-                auto completed = std::move(terminal_work->value());
-                terminal_work->reset();
-                completeTerminalAction(
-                    TerminalAction(std::move(completed), status, false));
-            });
-        session->initiate(terminal_work->value().slice->source_addr,
-                          terminal_work->value().slice->tcp.dest_addr,
-                          terminal_work->value().slice->length,
-                          terminal_work->value().slice->opcode);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "TcpTransport::startTransfer encountered an exception. "
-                      "Slice details - source_addr: "
-                   << slice->source_addr << ", length: " << slice->length
-                   << ", opcode: " << (int)slice->opcode
-                   << ", target_id: " << slice->target_id
-                   << ". Exception: " << e.what();
-        closeSocketNoThrow(socket);
-        if (terminal_work && terminal_work->has_value()) {
-            auto failed = std::move(terminal_work->value());
-            terminal_work->reset();
-            failWorkItem(std::move(failed), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        } else if (work.slice) {
-            failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        }
-    } catch (...) {
-        LOG(ERROR) << "TcpTransport::startTransfer encountered an unknown "
-                      "exception. Slice details - source_addr: "
-                   << slice->source_addr << ", length: " << slice->length
-                   << ", opcode: " << (int)slice->opcode
-                   << ", target_id: " << slice->target_id;
-        closeSocketNoThrow(socket);
-        if (terminal_work && terminal_work->has_value()) {
-            auto failed = std::move(terminal_work->value());
-            terminal_work->reset();
-            failWorkItem(std::move(failed), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        } else if (work.slice) {
-            failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        }
-    }
+    // Pool-disabled transfers still need asynchronous, cancellable DNS and
+    // connect. Use tracked lanes but close the socket after each request.
+    work.reuse_connection = enable_connection_pool_ || reuse_connection;
+    enqueuePooledTransfer(desc->name, key, std::move(work));
 }
 
 }  // namespace mooncake

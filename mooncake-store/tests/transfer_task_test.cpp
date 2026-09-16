@@ -209,6 +209,7 @@ TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
             auto description =
                 engine.getMetadata()->getSegmentDescByID(segment);
             ASSERT_NE(description, nullptr);
+            const auto original_port = description->tcp_data_port;
             description->tcp_data_port = peer.port();
             description->tcp_proto_version = 2;
             description->tcp_data_host = "127.0.0.1";
@@ -225,8 +226,10 @@ TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
             ASSERT_TRUE(engine.submitTransfer(second, requests).ok());
             ASSERT_TRUE(peer.wait_for_connections(2));
             {
+                // A nonexistent second status slot injects query failure.
+                // Cancellation must still safely terminate and free the batch.
                 TransferEngineOperationState a(engine, first, 1),
-                    b(engine, second, 1);
+                    b(engine, second, 2);
                 const auto start = std::chrono::steady_clock::now();
                 auto one = std::async(std::launch::async,
                                       [&] { a.wait_for_completion(); });
@@ -238,7 +241,7 @@ TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
                           std::chrono::seconds(3));
                 EXPECT_EQ(a.get_result(), ErrorCode::TRANSFER_FAIL);
                 EXPECT_EQ(b.get_result(), ErrorCode::TRANSFER_FAIL);
-                EXPECT_FALSE(transport->isAvailable());
+                EXPECT_TRUE(transport->isAvailable());
                 // Quiescence precedes caller buffer reuse; late network data
                 // must not overwrite it, even while the engine remains alive.
                 std::fill(buffer.begin(), buffer.end(), 'z');
@@ -249,10 +252,18 @@ TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
                 EXPECT_TRUE(std::all_of(buffer.begin(), buffer.end(),
                                         [](char c) { return c == 'z'; }));
             }
-            // The poisoned transport refuses further work without hanging.
-            const auto rejected = engine.allocateBatchID(1);
-            EXPECT_FALSE(engine.submitTransfer(rejected, requests).ok());
-            EXPECT_TRUE(engine.freeBatchID(rejected).ok());
+            // Recover without rebuilding Client/TransferEngine. Restoring
+            // the real endpoint exercises both the new listener and client.
+            description->tcp_data_port = original_port;
+            for (int iteration = 0; iteration < 3; ++iteration) {
+                ScopedEnvVar recovery_deadline("MC_STORE_TRANSFER_TIMEOUT_MS",
+                                               "2000");
+                const auto recovered = engine.allocateBatchID(1);
+                ASSERT_TRUE(engine.submitTransfer(recovered, requests).ok());
+                TransferEngineOperationState state(engine, recovered, 1);
+                state.wait_for_completion();
+                EXPECT_EQ(state.get_result(), ErrorCode::OK);
+            }
             ASSERT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
         }
     }

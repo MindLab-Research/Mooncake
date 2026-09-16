@@ -1223,6 +1223,8 @@ void TcpTransport::handleLaneTerminal(
             !lane->current) {
             stale = true;
         } else {
+            connection_clean =
+                connection_clean && lane->current->reuse_connection;
             action.emplace(std::move(*lane->current), status, connection_clean);
             lane->current.reset();
             lane->session.reset();
@@ -1268,6 +1270,10 @@ void TcpTransport::handleLaneTerminal(
         } else {
             lane->socket.reset();
             lane->state = LaneState::DISCONNECTED;
+            // A successful one-shot request closed deliberately, not because
+            // the peer is unreachable. Permit another connection this round.
+            if (status == TransferStatusEnum::COMPLETED)
+                lane->last_connect_round = 0;
             // Keep this lane marked as tried in the current round. If another
             // lane is still usable, wait for the group cooldown before a new
             // round can retry disconnected lanes. If this was the last usable
