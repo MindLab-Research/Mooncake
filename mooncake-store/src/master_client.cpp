@@ -594,9 +594,11 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-MasterClient::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys) {
+MasterClient::BatchGetReplicaListForAdmin(
+    const std::vector<std::string>& keys) {
     return invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
-                            GetReplicaListResponse>(keys.size(), keys, tenant_id_.value());
+                            GetReplicaListResponse>(keys.size(), keys,
+                                                    tenant_id_.value());
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>

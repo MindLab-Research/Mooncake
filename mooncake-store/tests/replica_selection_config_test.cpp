@@ -16,7 +16,8 @@ class ReplicaSelectionConfigTest : public ::testing::Test {
             original_ = value;
         }
         ASSERT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
-        if (const char* value = std::getenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT"))
+        if (const char* value =
+                std::getenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT"))
             original_endpoint_ = value;
         ASSERT_EQ(unsetenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT"), 0);
     }
@@ -24,7 +25,8 @@ class ReplicaSelectionConfigTest : public ::testing::Test {
     void TearDown() override {
         if (original_endpoint_)
             EXPECT_EQ(setenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT",
-                             original_endpoint_->c_str(), 1), 0);
+                             original_endpoint_->c_str(), 1),
+                      0);
         else
             EXPECT_EQ(unsetenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT"), 0);
         if (original_.has_value()) {
@@ -48,9 +50,12 @@ TEST_F(ReplicaSelectionConfigTest, UnsetDisablesScoring) {
 TEST_F(ReplicaSelectionConfigTest, RequiredEndpointIsExplicitAndExact) {
     EXPECT_TRUE(ReplicaSelectionConfig::FromEnvironment()
                     .required_offload_endpoint.empty());
-    ASSERT_EQ(setenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT", "10.254.254.2:40879", 1), 0);
-    EXPECT_EQ(ReplicaSelectionConfig::FromEnvironment().required_offload_endpoint,
-              "10.254.254.2:40879");
+    ASSERT_EQ(
+        setenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT", "10.254.254.2:40879", 1),
+        0);
+    EXPECT_EQ(
+        ReplicaSelectionConfig::FromEnvironment().required_offload_endpoint,
+        "10.254.254.2:40879");
     ASSERT_EQ(unsetenv("MC_STORE_REQUIRED_OFFLOAD_ENDPOINT"), 0);
     EXPECT_TRUE(ReplicaSelectionConfig::FromEnvironment()
                     .required_offload_endpoint.empty());

@@ -312,8 +312,7 @@ TEST_F(ReplicaSelectionTest, LocalDiskPrecedesDisk) {
 
 TEST_F(ReplicaSelectionTest, RequiredOffloadOverridesLocalAndRemoteMemory) {
     std::vector<Replica::Descriptor> reps = {
-        MakeMemory("local-memory", "tcp"),
-        MakeMemory("remote-memory", "tcp"),
+        MakeMemory("local-memory", "tcp"), MakeMemory("remote-memory", "tcp"),
         MakeLocalDisk("10.254.254.1:40000"),
         MakeLocalDisk("10.254.254.2:40000")};
     const std::unordered_set<std::string> local = {"local-memory"};
@@ -321,7 +320,8 @@ TEST_F(ReplicaSelectionTest, RequiredOffloadOverridesLocalAndRemoteMemory) {
     EXPECT_EQ(SelectBestReplica(reps, local, "10.254.254.2:40000"), &reps[3]);
 }
 
-TEST_F(ReplicaSelectionTest, RequiredOffloadDoesNotFallbackOrMatchPartialEndpoint) {
+TEST_F(ReplicaSelectionTest,
+       RequiredOffloadDoesNotFallbackOrMatchPartialEndpoint) {
     std::vector<Replica::Descriptor> reps = {
         MakeMemory("10.254.254.2:40000", "tcp"),
         MakeLocalDisk("10.254.254.20:40000"),

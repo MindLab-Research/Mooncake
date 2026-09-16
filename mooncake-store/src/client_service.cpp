@@ -1222,7 +1222,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         result.value().object_checksum);
 }
 
-tl::expected<int, ErrorCode> Client::QueryReplicaStatus(const std::string& key) {
+tl::expected<int, ErrorCode> Client::QueryReplicaStatus(
+    const std::string& key) {
     auto results = master_client_.BatchGetReplicaListForAdmin({key});
     if (results.size() != 1) return tl::unexpected(ErrorCode::RPC_FAIL);
     if (!results[0]) return tl::unexpected(results[0].error());

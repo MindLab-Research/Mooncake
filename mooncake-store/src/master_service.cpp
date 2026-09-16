@@ -4917,8 +4917,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const bool replacing_existing = metadata.HasReplica(
-        [client_id](const Replica& rep) {
+    const bool replacing_existing =
+        metadata.HasReplica([client_id](const Replica& rep) {
             return rep.is_local_disk_replica() &&
                    rep.get_descriptor().get_local_disk_descriptor().client_id ==
                        client_id;
@@ -8230,13 +8230,14 @@ auto MasterService::NotifyOffloadSuccess(
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
-                    } else if (!obj_metadata.HasReplica(
-                                   [client_id](const Replica& rep) {
-                                       return rep.is_local_disk_replica() &&
-                                              rep.get_descriptor()
-                                                      .get_local_disk_descriptor()
-                                                      .client_id == client_id;
-                                   })) {
+                    } else if (!obj_metadata.HasReplica([client_id](
+                                                            const Replica&
+                                                                rep) {
+                                   return rep.is_local_disk_replica() &&
+                                          rep.get_descriptor()
+                                                  .get_local_disk_descriptor()
+                                                  .client_id == client_id;
+                               })) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));

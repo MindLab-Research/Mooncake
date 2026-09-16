@@ -10,9 +10,10 @@ ReplicaSelectionConfig ReplicaSelectionConfig::FromEnvironment() {
     const auto value = Environ::Read(
         ReplicaSelectionEnvironmentVariables::MC_STORE_REPLICA_SCORING);
     config.remote_scoring_enabled = value.has_value() && *value == "1";
-    config.required_offload_endpoint = Environ::Read(
-        ReplicaSelectionEnvironmentVariables::MC_STORE_REQUIRED_OFFLOAD_ENDPOINT)
-                                          .value_or("");
+    config.required_offload_endpoint =
+        Environ::Read(ReplicaSelectionEnvironmentVariables::
+                          MC_STORE_REQUIRED_OFFLOAD_ENDPOINT)
+            .value_or("");
     return config;
 }
 

@@ -83,8 +83,8 @@ int main() {
     const char* master = std::getenv("MOONCAKE_TEST_MASTER");
     const int setup = mooncake_store_setup_with_offload(
         client, host_id ? host_id : "127.0.0.1:17300",
-        metadata ? metadata : "P2PHANDSHAKE", memory_mib << 20,
-        local_mib << 20, "tcp", "", master ? master : "127.0.0.1:17400", "");
+        metadata ? metadata : "P2PHANDSHAKE", memory_mib << 20, local_mib << 20,
+        "tcp", "", master ? master : "127.0.0.1:17400", "");
     Response ready;
     ready.op = "started";
     ready.pid = getpid();
