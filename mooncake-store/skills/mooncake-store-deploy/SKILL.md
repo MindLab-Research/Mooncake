@@ -60,7 +60,7 @@ local_buffer_size = 536870912
 
 容量、timeout、read limit 按模型对象大小及并发量设置；示例容量不是生产统一值。配置格式以当前 Mint 源码为准。确保 `mint://` 走 Mooncake，同时保留 `s3://` 的 S3Persistence 读取和回退。
 
-API 的 Mooncake 下载需要 `[server] public_base_url` 及独立的 `[auth] admin_management_token`（或对应的 `admin_management_token_file`）。管理凭据仅保存在服务端和受信任管理工具中，不能发给业务客户端；它与业务 `admin_token` 必须不同。下载 capability 使用管理凭据及专用 HMAC domain 签名；缺少管理凭据时下载接口返回 503，绝不退回业务凭据签名。
+API 的 Mooncake 下载需要 `[server] public_base_url` 及独立的 `[auth] download_signing_secret`（或对应的 `download_signing_secret_file`）。签名密钥仅保存在 API 服务端，不能发给业务客户端或管理工具；它与业务 `admin_token`、管理 `admin_management_token` 都必须不同。下载 capability 使用仅 API 持有的专用密钥及 HMAC domain 签名；缺少专用签名密钥时下载接口返回 503，绝不退回业务凭据签名。
 
 ## 真实验收
 

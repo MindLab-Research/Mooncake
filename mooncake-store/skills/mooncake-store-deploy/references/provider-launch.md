@@ -145,7 +145,7 @@ workers = 2
 url = "http://127.0.0.1:17420"
 ```
 
-这是 Mint API 的配置，不是 sidecar TOML。保持 loopback，并将 API 与 sidecar 放在同一网络命名空间；不要替换成跨 Pod Service。API 的模型 catalog 不会因为共享 Master 自动同步；通过当前候选提供的 artifact catalog export/import API 交接描述信息，再由目标 sidecar 读取对象。模型导入要求 base_model/LoRA metadata 匹配，不使用无模型 metadata 的普通 tar 冒充模型 checkpoint。API `[server] public_base_url` 必须设置为客户端下载可达的 HTTPS 基础地址，并正确转发下载路由。下载 token 使用 API `[auth] admin_management_token`，必须非空且与业务 `admin_token` 不同。通过受保护的 API TOML/Secret 配置；同一 API 的副本保持一致，轮换会使旧下载 token 失效。不要用 OSS 凭据代替。
+这是 Mint API 的配置，不是 sidecar TOML。保持 loopback，并将 API 与 sidecar 放在同一网络命名空间；不要替换成跨 Pod Service。API 的模型 catalog 不会因为共享 Master 自动同步；通过当前候选提供的 artifact catalog export/import API 交接描述信息，再由目标 sidecar 读取对象。模型导入要求 base_model/LoRA metadata 匹配，不使用无模型 metadata 的普通 tar 冒充模型 checkpoint。API `[server] public_base_url` 必须设置为客户端下载可达的 HTTPS 基础地址，并正确转发下载路由。下载 token 使用 API `[auth] download_signing_secret`，必须非空且与业务 `admin_token`、管理 `admin_management_token` 都不同。通过受保护的 API TOML/Secret 配置；同一 API 的副本保持一致，轮换会使旧下载 token 失效。不要用 OSS 凭据代替。
 
 读取探针使用独立的部署参数 TOML（不要把下面字段塞入 sidecar TOML）：
 
