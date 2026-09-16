@@ -15,6 +15,36 @@ MOONCAKE_STORE_LIB_DIR=<MOONCAKE_SHARED_LIB_DIR> \
 
 Rust 工具链使用 Mint 仓库要求。API 用集群既有生产构建流程，不能把验收时开启的 `mint-api/dev` 当作生产配置。装配后对 Master/provider/sidecar/API 和所有加载库记录 SHA-256，执行 ldd 并验证 12 个 FFI 符号及一次实际调用。目录名或单独的 Git SHA 不是运行版本证明。
 
+## Mint 专用容器镜像
+
+Mint 默认 `mint-store-sidecar` target 和 composer 镜像内附带的 sidecar 没有启用 `mooncake` feature；仅把 TOML 改为 Mooncake 不会获得原生能力。选择 `deploy/docker/Dockerfile` 的 **`mint-store-sidecar-mooncake`** target。从审核后的 Mint checkout 根目录构建，使用 Docker 27+ / BuildKit，构建平台为 Linux x86-64：
+
+```bash
+# Replace placeholders with the reviewed release inputs.
+python3 scripts/tools/verify_mooncake_runtime.py \
+  --runtime <NATIVE_BUNDLE_DIR> --manifest-sha256 <REVIEWED_MANIFEST_SHA256>
+docker buildx build --platform linux/amd64 \
+  -f deploy/docker/Dockerfile --target mint-store-sidecar-mooncake \
+  --build-arg RUST_VERSION=<CHANNEL_FROM_rust-toolchain.stable.toml> \
+  --build-context mooncake-runtime=<NATIVE_BUNDLE_DIR> \
+  --build-arg MOONCAKE_MANIFEST_SHA256=<REVIEWED_MANIFEST_SHA256> \
+  -t <SIDECAR_IMAGE:RELEASE_TAG> --load .
+```
+
+`RUST_VERSION` 必须是本次 checkout 的 `rust-toolchain.stable.toml` 中 channel 精确值；不要使用浮动 stable。镜像推送按集群现有发布流程执行，部署引用最终 registry digest。
+
+原生包须包含 `SHA256SUMS`、`source.json`、`include/store_c.h`、`lib/libmooncake_store.so` 和所有非系统运行库。`source.json` 至少记录 `schema_version: 1`、完整 `mooncake_commit`、`durable_delete_protocol_version: 3`。`SHA256SUMS` 逐项覆盖除自身之外的所有文件，格式为 SHA-256、两个空格、相对路径；包内不能含符号链接，打包时将所需库解引用成普通文件。manifest digest 必须来自已审核的发布记录，不能临时对未知包计算一个 digest 就视为可信。verifier 检查包完整性和声明，镜像构建检查动态链接；真实 Put/Get 才验证服务能力。
+
+专用镜像默认配置路径为 `/etc/mint/store-sidecar.toml`。现有 Compose 显式传入 `/mint/prd/config/mint-store-sidecar.toml`，以实际 command 为准并挂载匹配文件。保留镜像内适配器转换 venv、Mint 代码及共享 staging 卷，不用只含二进制的空镜像替换。
+
+## 对接现有 Mint 编排
+
+当前 `deploy/docker/compose.yaml` 使用 `network_mode: host`，sidecar 默认探测 `127.0.0.1:7100`；本 skill 的 `17420` 是隔离开发示例。沿用生产已有端口，或同时修改 sidecar `[listen].addr`、API `[sidecar].url`、composer 配置中的 sidecar URL 和健康探针。不要把业务全部切到跨地域 sidecar。
+
+Compose 的 `store-sidecar.image` 必须覆盖为上述 Mooncake 专用镜像的 digest。API/composer 与 sidecar 使用同一宿主网络；Kubernetes 则让调用方与 sidecar 共享 Pod 网络。API 和 composer 分开部署时，每个调用方都必须具备本地可达的 sidecar 及所需共享 staging 路径。不要照搬 hostNetwork 给不受信任工作负载：loopback sidecar 无鉴权，网络命名空间是访问边界。
+
+现有 Compose TCP healthcheck 只证明端口监听，不能发现原生 transport 已失效。部署方需把已知正控对象的实际 GetBlob 校验接入业务 readiness，并配置失败撤流与重建；本 skill 的 `read_probe.py` 默认 RPC 期限 240 秒，适合验收，不能直接作为每 5 秒运行的高频探针。探针所需 Python/grpc/stub 也不假定已在生产镜像内提供。恢复演练必须验证 provider 重启后重新发现 endpoint/segment、更新 sidecar，以及失效 transport 重建后正控读取恢复。
+
 ## 部署顺序
 
 1. 挂载持久 journal，单独启动一个 Master。现有共享 Master 可复用，不为每个地域再创建一个。按启动参考配置内网 RPC/metadata 地址。
