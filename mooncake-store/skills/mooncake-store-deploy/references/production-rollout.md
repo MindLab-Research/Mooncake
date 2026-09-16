@@ -61,9 +61,9 @@ Compose 的 `store-sidecar.image` 必须覆盖为上述 Mooncake 专用镜像的
 
 ## 常驻、重启与升级
 
-由集群已有 supervisor/Kubernetes 管理进程。Master 和 provider/sidecar 分别管理；不能通过一个区域 Pod 的生命周期误停 Master。provider 重启后 endpoint/segment 可能变化，部署入口必须重新发现并更新依赖它的 sidecar；普通静态 ConfigMap 加 RestartPolicy 不能自动完成这一步。使用启动参考的注册日志/descriptor 获取本次值，确认新配置生效后重新开放流量。
+由集群已有 supervisor/Kubernetes 管理进程。Master 和 provider/sidecar 分别管理；不能通过一个区域 Pod 的生命周期误停 Master。provider 重启后 endpoint/segment 可能变化，部署入口必须重新发现并更新依赖它的 sidecar；普通静态 ConfigMap 加 RestartPolicy 不能自动完成这一步。使用启动参考的注册日志/descriptor 获取本次值，确认新配置生效后重新开放流量。Docker 自动重启期间不能仅凭 `RestartCount` 增加就读取端口；须同时确认新 PID、变化后的 `StartedAt` 和运行状态，再只读取该次启动后的日志或当前 descriptor。跨代日志中的旧端口会导致 `rc=-702`；须以实际 GetBlob 正控成功作为重新开放流量条件。
 
-升级按地域逐个撤流、等待在途调用结束、切换配套库/provider/sidecar、重新发现路由、验证正控读写再恢复流量。TCP transport 被安全终止后即使进程存活也不可继续复用；由业务探针识别并重建对应进程。按对象大小/并发调优缓冲池与期限，开发样本的时延不是生产 SLA。
+升级按地域逐个撤流、等待在途调用结束、切换配套库/provider/sidecar、重新发现路由、验证正控读写再恢复流量。TCP 成功停止旧执行器后会在原端口重建，可继续新请求；若重建失败、transport 不可用，由业务探针撤流并重建进程。独立托管的 provider/sidecar 显式启用 `MC_STORE_TRANSFER_FATAL_TIMEOUT=1` 与 `MC_STORE_TRANSFER_ABORT_GRACE_MS=5000`，使无法停止的原生 batch 在宽限期后退出 124；配置失败重启、退避和告警，并按前述流程刷新 provider 路由。不要向内嵌训练主进程默认注入退出策略。按对象大小/并发调优缓冲池与期限，开发样本的时延不是生产 SLA。
 
 ## 回滚
 

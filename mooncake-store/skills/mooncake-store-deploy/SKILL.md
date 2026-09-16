@@ -9,9 +9,9 @@ description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生�
 
 ## 先确定版本和网络
 
-记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。历史 live 验收绑定的运行源码为 Mooncake `a8657c7397ac23ec37550d9d5487026010041ab2`、Mint `90913210df556196f8ae51f86dac4e277b2e8c7f`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
+记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。2026-09-16 最新开发机镜像 live 验收绑定的运行源码为 Mooncake `db65d41a4cac63ec055806922b15981aea1314a2`、Mint `aa9a1e67cbd2a740a2569b92a563cb7663d83d29`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
 
-原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前采用显式启用的非 TCP/Tent 进程隔离恢复；新候选两地 live 验收和镜像绑定尚未全部关闭，不得将历史 PASS 当作当前候选的生产放行依据。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
+原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前采用显式启用的原生传输进程隔离恢复；该运行候选的两地 live 验收和本地镜像绑定已通过。退出 124/自动重启通过故障注入验证，两地 provider 异常退出后的路由刷新与真实读取也通过；未测试 RDMA 硬件或启用 Tent 的构建。配套镜像尚未发布 ACR，生产放行仍需维护者审核、镜像发布及目标集群门禁。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
 
 每个节点必须能够访问同一个 Master RPC 和 HTTP metadata 服务；Master/客户端也必须能回连 provider offload RPC、Transfer Engine 和 TCP 数据端口。只通 50481 不够。动态端口要使用可双向路由的专网地址或测试 overlay；不要将公网任意端口全部开放。
 
@@ -72,11 +72,11 @@ python scripts/read_probe.py --config node.toml \
 
 双向执行。为了证明 OSS 冷读，停止源端 provider/sidecar，保留共享 Master；目标端使用新 Store 进程、新 segment 和空 sidecar 缓存目录。保存停止状态、PID、实际配置、provider 回源日志及结果。随后交换源和目标重复。每一阶段确认 Master PID未被区域 Store 停启改变。
 
-记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。新部署按下述门禁做上线验证。下文历史 live 结果只适用于其绑定的运行版本；PR 后续运行代码变更须补充受影响门禁，不可直接继承通过结论。
+记录多次 RPC/Put/Get 的 p50/p95、对象大小、并发和失败率。单次 1–4 MiB 成功不代表大 checkpoint、GPU optimizer 恢复或生产性能验收。新部署按下述门禁做上线验证。下文 live 结果只适用于其绑定的运行版本；PR 后续运行代码变更须补充受影响门禁，不可直接继承通过结论。
 
 ## 验收结论与使用边界
 
-2026-09-16 历史绑定候选（Mooncake `a8657c73`、Mint `90913210`）已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
+2026-09-16 镜像绑定候选（Mooncake `db65d41a`、Mint `aa9a1e67`）已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
 
 删除必须先完成 OSS durable delete，再清除 Master metadata。失败保留 metadata；两地验收还需并发重复删除、冷启动不复活及未删除正控可读。既有读租约约 900 秒，删除可能等待该窗口并需要重试；保留首次结果及累计时延，不得缩短保护窗口以加速验收。
 
@@ -84,7 +84,7 @@ python scripts/read_probe.py --config node.toml \
 
 ## 新上传协议与 journal 恢复
 
-新 provider 的 Put/PutV 使用持久 multipart upload ID，删除通过 OSS/S3 的 AbortMultipartUpload 撤销残留 writer，禁止按 TTL 猜测可删除。凭据必须包含 multipart 中止权限。升级前排空旧 v1 writer；旧 admission 没有可撤销 ID，不能自动清除。journal 介质损坏时使用独立、完整且匹配的 mirror 离线修复，不得删除坏行强行启动。步骤与边界见[删除恢复说明](../../docs/durable-delete-recovery.md)。
+新 provider 的 Put/PutV 使用持久 multipart upload ID，删除通过 OSS/S3 的 AbortMultipartUpload 撤销残留 writer，禁止按 TTL 猜测可删除。凭据必须包含 multipart 中止权限。升级前排空旧 v1 writer；旧 admission 没有可撤销 ID，不能自动清除。journal 介质损坏时使用独立、完整且匹配的 mirror 离线修复，不得删除坏行强行启动。步骤与边界见[删除恢复说明](references/durable-delete-recovery.md)。
 
 ## 故障恢复
 
@@ -108,4 +108,4 @@ Mint 仓库中的配置模板、固定依赖和活体测试入口见 [Mint 验�
 
 ### 无法取消的托管传输
 
-独立 provider/sidecar 启用 `MC_STORE_TRANSFER_FATAL_TIMEOUT=1`、`MC_STORE_TRANSFER_ABORT_GRACE_MS=5000`，并配置失败自动重启。原生 batch 等待超时后仍无物理停止证明时进程退出 124，不执行析构；同进程并发请求也失败。通用库默认不启用，禁止默认注入内嵌训练进程。该策略不撤回已到达远端的写，不把请求失败等同于对象不存在。provider 重启后必须重取 segment/offload endpoint 并更新 sidecar，共享 Master/journal 不重建。故障测试需保存 exit code、重启次数、新进程 ID 和恢复后的真实读取。详见 [协议与恢复说明](../../docs/durable-delete-recovery.md)。
+独立 provider/sidecar 启用 `MC_STORE_TRANSFER_FATAL_TIMEOUT=1`、`MC_STORE_TRANSFER_ABORT_GRACE_MS=5000`，并配置失败自动重启。原生 batch 等待超时后仍无物理停止证明时进程退出 124，不执行析构；同进程并发请求也失败。通用库默认不启用，禁止默认注入内嵌训练进程。该策略不撤回已到达远端的写，不把请求失败等同于对象不存在。provider 重启后必须重取 segment/offload endpoint 并更新 sidecar，共享 Master/journal 不重建。故障测试需保存 exit code、重启次数、新进程 ID 和恢复后的真实读取。详见 [协议与恢复说明](references/durable-delete-recovery.md)。
