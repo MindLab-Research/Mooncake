@@ -406,7 +406,7 @@ TEST(DurableProviderRpcTest,
     config.default_kv_lease_ttl = 0;
     // This receipt-only provider has no heartbeat loop; three delete attempts
     // each wait out the protocol's read lease.
-    config.client_live_ttl_sec = 60;
+    config.client_live_ttl_sec = 120;
     config.enable_offload = true;
     config.enable_metric_reporting = false;
     config.durable_delete_journal_path = std::string(directory) + "/journal";
@@ -417,6 +417,10 @@ TEST(DurableProviderRpcTest,
                             -> tl::expected<DurableDeleteReceipt, ErrorCode> {
         auto valid = master.ValidateDurableDeleteAssignment(command);
         if (!valid) return tl::make_unexpected(valid.error());
+        // Real remote scans and OSS deletion can exceed the ordinary 30s RPC
+        // budget. Exercise both coordinator hops over real sockets; a short
+        // fake-clock test would not catch either transport's default timeout.
+        if (mode == 2) std::this_thread::sleep_for(std::chrono::seconds(31));
         return DurableDeleteReceipt{
             command.provider_id, command.operation_id,
             mode == 0 ? generate_uuid() : command.assignment_id,

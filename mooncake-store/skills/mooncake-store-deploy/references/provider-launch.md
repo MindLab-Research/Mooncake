@@ -4,7 +4,7 @@
 
 ## 运行文件
 
-为候选建立独立目录，包含 `services/mooncake_client`、`lib/libmooncake_store.so`、`lib/libasio.so` 和 `mint-store-sidecar`。AWS SDK 依赖放在独立 lib 目录。执行 `LD_LIBRARY_PATH=<LIB_DIR>:<AWS_LIB_DIR> ldd <PROVIDER>`，对 sidecar 和动态库也执行同样检查；所有依赖必须解析成功。记录文件 SHA-256、源码提交和未提交 patch 的 hash。
+为候选建立独立目录，包含 `services/mooncake_client`、`lib/libmooncake_store.so`、`lib/libasio.so` 和 `mint-store-sidecar`。裸机部署时 AWS SDK 依赖可放在独立 lib 目录；镜像 runtime bundle 必须放在 `lib/` 或 `aws/lib/`，镜像只加载这两个已校验目录。执行 `LD_LIBRARY_PATH=<LIB_DIR>:<AWS_LIB_DIR> ldd <PROVIDER>`，对 sidecar 和动态库也执行同样检查；所有依赖必须解析成功。记录文件 SHA-256、源码提交和未提交 patch 的 hash。
 
 ## 唯一 Master
 

@@ -4,6 +4,7 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 #include <vector>
 #include <async_simple/coro/Lazy.h>
 #include <ylt/util/tl/expected.hpp>
@@ -11,6 +12,13 @@
 #include "types.h"
 
 namespace mooncake {
+// Delete includes serialized cloud work and a read-fence drain. Keep its
+// budgets separate from ordinary 30s metadata RPCs. The coordinator gets an
+// extra response margin; expiry still preserves metadata for a safe retry.
+inline constexpr auto kDurableProviderDeleteTimeout = std::chrono::seconds(120);
+inline constexpr auto kDurableCoordinatorDeleteTimeout =
+    std::chrono::seconds(150);
+
 struct DurableDeleteCommand {
     UUID provider_id;
     UUID operation_id;

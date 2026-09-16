@@ -6,6 +6,7 @@
 
 #include <csignal>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -373,8 +374,17 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    if constexpr (std::string_view(
+                                      RpcNameTraits<ServiceMethod>::value) ==
+                                  "RemoveDurable") {
+                        return client.send_request<ServiceMethod>(
+                            coro_rpc::request_config_t{
+                                kDurableCoordinatorDeleteTimeout},
+                            std::forward<Args>(args)...);
+                    } else {
+                        return client.send_request<ServiceMethod>(
+                            std::forward<Args>(args)...);
+                    }
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";

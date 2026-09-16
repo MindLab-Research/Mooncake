@@ -131,8 +131,8 @@ RequestDurableProviderDelete(std::string endpoint,
     coro_rpc::coro_rpc_client client;
     auto connected = co_await client.connect(endpoint);
     if (connected) co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-    auto response =
-        co_await client.call<&DurableDeleteRpcHandler::Execute>(command);
+    auto response = co_await client.call_for<&DurableDeleteRpcHandler::Execute>(
+        kDurableProviderDeleteTimeout, command);
     if (!response) {
         co_return tl::make_unexpected(response.error().code ==
                                               coro_rpc::errc::timed_out
