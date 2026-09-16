@@ -53,6 +53,12 @@ Compose 的 `store-sidecar.image` 必须覆盖为上述 Mooncake 专用镜像的
 4. 启动 sidecar 后执行真实小对象 Put/Get，核对 hash，再开放该 Mint 实例流量。sidecar 的 17420 是 gRPC，不存在可直接照搬的 HTTP `/health` 探针。原生 C ABI health 与其可选 HTTP server 也不是自动暴露在 sidecar gRPC 端口；readiness 应使用已知正控对象的真实 GetBlob 或已有平台的业务探针。
 5. 使用独立验收 namespace 完成双向 1/4/96 MiB、源下线冷读、删除保护、token 与历史 S3 门禁后，再接入业务 namespace。冷读/删除故障注入在隔离验证实例执行，不能停止生产服务或删除业务 checkpoint 来验收。
 
+## 同节点多实例与旧 S3 endpoint
+
+同一可路由 IP 下部署多个 sidecar 时，为每个原生客户端配置不同的 `local_hostname`（例如 `<NODE_IP>:18638`、`<NODE_IP>:18639`），并记录本次实际 RPC/数据端口。不能全部使用 `<NODE_IP>:0`：`MOONCAKE_HOST_ID` 的不同值不足以区分 HTTP metadata 中的 `rpc_meta/<local_hostname>`，可能导致 `Duplicate rpc_meta key not allowed`。单实例开发示例的 `:0` 不应直接复制到同节点多副本。滚动重建需先确认旧实例退出、旧 metadata 注册完成清理，再启新实例；不能让两代进程同时占用同一个身份。
+
+旧 S3 回退 `[store] endpoint_internal` 还有 sidecar 启动前的裸 endpoint DNS/TCP 检查。不能直接把 provider 的 `https://oss-accelerate.aliyuncs.com` 填过去：该裸域名在部分环境无地址，而 provider 的 bucket 虚拟域名仍可用。本轮回退使用可解析的 `https://oss-cn-beijing.aliyuncs.com`；生产按实际旧服务 endpoint 配置，并在目标容器内检查 DNS/TCP、真实历史对象读取及 presign 下载。该限制不改变 Mooncake provider 使用 OSS accelerate 的配置。
+
 ## 常驻、重启与升级
 
 由集群已有 supervisor/Kubernetes 管理进程。Master 和 provider/sidecar 分别管理；不能通过一个区域 Pod 的生命周期误停 Master。provider 重启后 endpoint/segment 可能变化，部署入口必须重新发现并更新依赖它的 sidecar；普通静态 ConfigMap 加 RestartPolicy 不能自动完成这一步。使用启动参考的注册日志/descriptor 获取本次值，确认新配置生效后重新开放流量。
