@@ -189,6 +189,49 @@ TEST_F(DurableDeleteJournalTest, MoreThanTenThousandKeysSurviveRestart) {
         journal.Commit({"tenant", "10001", "operation", false, "scope-a"}));
 }
 
+TEST_F(DurableDeleteJournalTest, OfflineMirrorRepairReplaysWithNativeReader) {
+    {
+        DurableDeleteJournal journal(path);
+        ASSERT_TRUE(
+            journal.Commit({"tenant", "key", "operation", false, "scope-a"}));
+        ASSERT_TRUE(
+            journal.Commit({"tenant", "key", "operation", true, "scope-a"}));
+        ASSERT_TRUE(
+            journal.Commit({"tenant", "next", "operation", false, "scope-a"}));
+    }
+    const auto mirror = directory + "/mirror";
+    const auto output = directory + "/repaired";
+    std::filesystem::copy_file(path, mirror);
+    {
+        std::fstream corrupt(path, std::ios::in | std::ios::out);
+        corrupt.put('x');
+    }
+    EXPECT_THROW(DurableDeleteJournal original(path), std::runtime_error);
+    const auto tool =
+        (std::filesystem::path(__FILE__).parent_path().parent_path() /
+         "tools/repair_delete_journal.py")
+            .string();
+    const auto pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        execlp("python3", "python3", tool.c_str(), path.c_str(), "--mirror",
+               mirror.c_str(), "--output", output.c_str(), nullptr);
+        _exit(127);
+    }
+    int status;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_THROW(DurableDeleteJournal original(path), std::runtime_error);
+    DurableDeleteJournal restored(output);
+    auto records = restored.Records();
+    ASSERT_EQ(records.size(), 2);
+    EXPECT_EQ(records[0].key, "key");
+    EXPECT_TRUE(records[0].completed);
+    EXPECT_EQ(records[1].key, "next");
+    EXPECT_FALSE(records[1].completed);
+}
+
 TEST_F(DurableDeleteJournalTest, InvalidPathAndCompletionWithoutBeginRefused) {
     EXPECT_THROW(DurableDeleteJournal journal("relative.log"),
                  std::invalid_argument);

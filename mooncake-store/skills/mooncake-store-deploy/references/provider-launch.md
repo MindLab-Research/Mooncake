@@ -22,7 +22,7 @@ Master 不需要 OSS 凭据；regional provider 负责对象字节。不要随 S
 
 ## provider 专属环境
 
-用权限 0600 的文件保存以下环境配置。凭据来自获准的密钥管理渠道，禁止写入 skill、Git 或验收日志。只向 provider 进程注入该文件，不向 sidecar/Mint 注入。
+用权限 0600 的文件保存以下环境配置。凭据来自获准的密钥管理渠道，禁止写入 skill、Git 或验收日志。只向 provider 进程注入该文件，不向 sidecar/Mint 注入。新上传协议需要 multipart 创建、分片上传、完成和中止权限（AWS `s3:AbortMultipartUpload` / OSS `oss:AbortMultipartUpload`）；缺少中止权限必须保留 metadata 并报错，不能放宽删除围栏。
 
 ```bash
 MOONCAKE_AWS_ACCESS_KEY_ID=<ACCESS_KEY>

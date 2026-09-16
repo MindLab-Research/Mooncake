@@ -1658,10 +1658,19 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        auto wrapped_master_service =
-            std::make_shared<mooncake::WrappedMasterService>(
-                mooncake::WrappedMasterServiceConfig(master_config, version),
-                metadata_server_ptr, http_metadata_remote_url);
+        std::shared_ptr<mooncake::WrappedMasterService> wrapped_master_service;
+        try {
+            wrapped_master_service =
+                std::make_shared<mooncake::WrappedMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config,
+                                                         version),
+                    metadata_server_ptr, http_metadata_remote_url);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Master startup refused: " << error.what()
+                       << "; preserve the journal and use offline recovery. "
+                          "Never delete confirmed fences to force startup.";
+            return 1;
+        }
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);
