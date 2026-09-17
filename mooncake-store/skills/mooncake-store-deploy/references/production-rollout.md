@@ -2,7 +2,9 @@
 
 ## 发布输入
 
-采用 Mooncake #1 与 Mint #1314 审核后的配套源码，固定实际合并 commit 和构建镜像 digest。如果合并含运行代码变化，重新执行受影响的验收；仅文档变更可沿用已绑定运行包。确认发布单给出了：唯一 Master 地址、两地可双向回连的 provider 地址、稳定且唯一的 host identity、OSS endpoint/bucket/prefix、持久 journal 卷、节点 state/cache 卷、Mint Pod 放置方式、旧 S3 配置与 API 管理签名密钥。
+采用 Mooncake #1 与 Mint #1314 审核后的配套源码，固定实际合并 commit 和构建镜像 digest。如果合并含运行代码变化，重新执行受影响的验收；仅文档变更可沿用已绑定运行包。确认发布单给出了：唯一 Master 地址、两地可双向回连的 provider 地址、稳定且唯一的 host identity、OSS endpoint/bucket/prefix、持久 journal 卷、节点 state/cache 卷、Mint Pod 放置方式、旧 S3 配置、catalog 签名/信任根、API 管理凭据与独立下载签名密钥。
+
+发布前从当前 PR 获取最终代码状态：Mint #1314 与 Mooncake #1 分别核对 head、CI、自动审查和维护者批准。一个仓库通过不能替代另一个仓库；没有 check run 不等于检查通过。复制整个 `mooncake-store/skills/mooncake-store-deploy/` 目录供同事使用，保留 references 和 scripts，并记录它来自哪个 Mooncake commit。本机安装副本只用于辅助，仓库审核版本为准。
 
 ## 构建和装配
 

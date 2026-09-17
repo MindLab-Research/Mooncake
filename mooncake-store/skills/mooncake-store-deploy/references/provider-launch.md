@@ -210,3 +210,9 @@ credentials_file = "/run/secrets/mint-legacy-s3.ini"
 LoRA rank 缺省或为0时，catalog export 从已读取的权重对象根目录 `adapter_config.json` 解析实际正整数 `r`，不把默认 rank 猜成某个值。该检查流式扫描，解压后最多16 GiB、配置文件最多64 KiB，并受 catalog 超时限制；缺失/重复配置、扩展 tar header 或超出限制拒绝导出，需提供符合规范的 checkpoint。
 
 catalog 的 admission acquire/release RPC 各有5秒期限；请求超时且结果不确定时保留原租约，不能强行删租约重试。catalog staging 保留25小时，覆盖最长24小时传输及租约余量；同一 staging 重试在行锁内续期。普通 upload 仍为1小时。
+
+## 上传与导入的业务约束
+
+`producer_resource_id` 必须指向 `training_model`；`kind=training/sampler` 选择 artifact 格式，不代表 producer 类型。`sampling_session` 作为 producer 返回 409，属于明确的兼容性收紧。由 training producer 上传 sampler 权重，再让采样 session 加载或导入；不能把采样容量 rank 当作实际 LoRA rank。跨集群通过签名 catalog export/import 交接模型和对象描述，目标配置相容的 base_model/LoRA metadata 后由自己的 sidecar 读取。共享 Master 不代替 Mint 数据库的业务 metadata 交接。
+
+当前完整对象读取会核对原生 get_size 与 get_into 的长度；短读返回可重试错误，不能作为成功 checkpoint 交付。长度错误应记录并排查对象、provider 和运行版本，不能关闭校验后继续上线。

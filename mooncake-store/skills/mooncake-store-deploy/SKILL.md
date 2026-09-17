@@ -13,9 +13,9 @@ description: 供运维同事将已审核的 OSS-backed Mooncake Store 接入生�
 
 ## 先确定版本和网络
 
-记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。2026-09-16 最新开发机镜像 live 验收绑定的运行源码为 Mooncake `db65d41a4cac63ec055806922b15981aea1314a2`、Mint `aa9a1e67cbd2a740a2569b92a563cb7663d83d29`。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
+记录 Mint/Mooncake commit、C header、Rust FFI 声明、动态库、Master/provider/sidecar/API SHA-256 和实际加载文件。2026-09-17 已归档的开发机镜像 live 验收绑定 Mooncake `bbf4c366a728427f65e786989688bbbaf3620fc6`、Mint `a3a78a995884520f05b9370f33efe9a3b5f9e67e`。Mint 后续候选 `831de20b747e7abd73b0ac420b791fe53ffee100` 已通过源码级回归、代码 CI 和 CRBOT（0 errors），但没有重新部署镜像完成两地全链路实测；不能把这两类证据混为同一版本。部署以两份 PR 最终审核的 commit 和发布 manifest 为准，不使用分支名或本段历史 SHA 自动选择镜像。后续纯文档提交不改变运行候选；如果修改运行代码，重跑受影响门禁并重新绑定，不能借用旧证据。
 
-原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前采用显式启用的原生传输进程隔离恢复；该运行候选的两地 live 验收和本地镜像绑定已通过。退出 124/自动重启通过故障注入验证，两地 provider 异常退出后的路由刷新与真实读取也通过；未测试 RDMA 硬件或启用 Tent 的构建。配套镜像尚未发布 ACR，生产放行仍需维护者审核、镜像发布及目标集群门禁。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
+原始报告、日志、verifier 和二进制证据包应从交付人提供的外部验收包获取，不提交 Git。历史提交已清理重写，旧 SHA 仅用于识别归档构建；部署当前候选前必须拿到与其源码及镜像 digest 绑定的新验收清单。当前采用显式启用的原生传输进程隔离恢复；该运行候选的两地 live 验收和本地镜像绑定已通过。退出 124/自动重启通过故障注入验证，两地 provider 异常退出后的路由刷新与真实读取也通过；未测试 RDMA 硬件或启用 Tent 的构建。本 skill 不提供可直接放行的生产镜像 digest；自动 CI 镜像发布成功不等于配套 runtime 已完成生产验收。生产放行仍需维护者审核、配套镜像 digest 和目标集群门禁。C ABI 没有数字版本查询函数；用全部 12 个 Mint 所需符号、声明、库 hash 及真实调用证明一致性。
 
 每个节点必须能够访问同一个 Master RPC 和 HTTP metadata 服务；Master/客户端也必须能回连 provider offload RPC、Transfer Engine 和 TCP 数据端口。只通 50481 不够。动态端口要使用可双向路由的专网地址或测试 overlay；不要将公网任意端口全部开放。
 
@@ -58,6 +58,8 @@ global_segment_size = 0
 local_buffer_size = 536870912
 ```
 
+API 与 sidecar 的 `[store] kind` 必须同时设置为 `mooncake`；composer 使用自己的配置结构，不复制 API/sidecar 的 Mooncake 表。完整双端配置及 S3 回滚见[启动参考](references/provider-launch.md)。
+
 容量、timeout、read limit 按模型对象大小及并发量设置；示例容量不是生产统一值。配置格式以当前 Mint 源码为准。确保 `mint://` 走 Mooncake，同时保留 `s3://` 的 S3Persistence 读取和回退。
 
 API 的 Mooncake 下载需要 `[server] public_base_url` 及独立的 `[auth] download_signing_secret`（或对应的 `download_signing_secret_file`）。签名密钥仅保存在 API 服务端，不能发给业务客户端或管理工具；它与业务 `admin_token`、管理 `admin_management_token` 都必须不同。下载 capability 使用仅 API 持有的专用密钥及 HMAC domain 签名；缺少专用签名密钥时下载接口返回 503，绝不退回业务凭据签名。
@@ -80,7 +82,7 @@ python scripts/read_probe.py --config node.toml \
 
 ## 验收结论与使用边界
 
-2026-09-16 镜像绑定候选（Mooncake `db65d41a`、Mint `aa9a1e67`）已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
+2026-09-17 归档镜像绑定候选（Mooncake `bbf4c366`、Mint `a3a78a99`）已完成双向 1/4/96 MiB Put/Get、源离线冷读、OSS hash、两地删除与失败保护、实际 catalog import/download、token 和真实 S3 回退。模型归档使用 CPU 重放；不声称 GPU optimizer、续训或 sampling 已验收。流式截断/过长/中途失败是实际 HTTP API 后注入 gRPC 故障，不能当作 OSS 故障实测。
 
 删除必须先完成 OSS durable delete，再清除 Master metadata。失败保留 metadata；两地验收还需并发重复删除、冷启动不复活及未删除正控可读。既有读租约约 900 秒，删除可能等待该窗口并需要重试；保留首次结果及累计时延，不得缩短保护窗口以加速验收。
 
