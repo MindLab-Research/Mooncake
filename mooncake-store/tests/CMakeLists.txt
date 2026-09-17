@@ -64,6 +64,7 @@ if(ENABLE_KV_EVENTS)
 endif()
 add_subdirectory(master_service)
 
+add_store_test(durable_delete_journal_test durable_delete_journal_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
@@ -138,6 +139,7 @@ add_test(
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
+add_store_test(durable_provider_rpc_test durable_provider_rpc_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
 endif()

@@ -51,6 +51,7 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/s3_object_storage_adapter.h"
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -5546,6 +5547,20 @@ CreateStorageBackend(const FileStorageConfig& config) {
         case StorageBackendType::kNvmeKv:
             return std::make_shared<NvmeKvStorageBackend>(config);
 
+        case StorageBackendType::kS3ObjectStorage: {
+#ifdef HAVE_AWS_SDK
+            auto s3_config = S3ObjectStorageConfig::FromEnvironment();
+            if (!s3_config.Validate() || config.enable_dfs) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return std::make_shared<DistributedStorageBackend>(
+                config, DistributedStorageConfig{}, nullptr,
+                std::make_unique<S3ObjectStorageAdapter>(std::move(s3_config)));
+#else
+            LOG(ERROR) << "s3_object_storage_backend requires AWS SDK";
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+        }
         case StorageBackendType::kDistributed: {
             auto distributed_config =
                 DistributedStorageConfig::FromEnvironment();

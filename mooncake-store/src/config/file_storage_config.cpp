@@ -62,6 +62,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     } else if (storage_backend_descriptor == "distributed_storage_backend") {
         config.storage_backend_type = StorageBackendType::kDistributed;
         config.enable_dfs = true;
+    } else if (storage_backend_descriptor == "s3_object_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kS3ObjectStorage;
+        config.enable_dfs = false;
     } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
         config.storage_backend_type = StorageBackendType::kNvmeKv;
     } else {
@@ -96,6 +99,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
                         config.heartbeat_interval_seconds);
+    config.s3_metadata_refresh_interval_seconds = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_S3_METADATA_REFRESH_INTERVAL_SECONDS,
+        config.s3_metadata_refresh_interval_seconds);
     config.client_buffer_gc_interval_seconds = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS,
         config.client_buffer_gc_interval_seconds);
@@ -206,7 +212,13 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
+    if (s3_metadata_refresh_interval_seconds != 0 &&
+        storage_backend_type != StorageBackendType::kS3ObjectStorage) {
+        LOG(ERROR) << "Periodic S3 metadata discovery requires the S3 backend";
+        return false;
+    }
+    if (storage_backend_type != StorageBackendType::kS3ObjectStorage &&
+        !ValidatePath(storage_filepath)) {
         return false;
     }
     if (total_keys_limit <= 0) {

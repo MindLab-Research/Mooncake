@@ -169,6 +169,11 @@ class TcpTransport : public Transport {
     Status submitTransferTaskGroup(
         const std::vector<TransferTask *> &task_list) override;
 
+    Status abortBatch(BatchID batch_id) override;
+    bool isAvailable() const override {
+        return running_.load(std::memory_order_acquire);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
@@ -178,6 +183,8 @@ class TcpTransport : public Transport {
                 std::shared_ptr<Topology> topo);
 
     int startHandshakeDaemon();
+    void startRuntime(int tcp_port);
+    int tcp_port_ = 0;
 
     int allocateLocalSegmentID(int tcp_data_port);
 
@@ -209,6 +216,7 @@ class TcpTransport : public Transport {
    private:
     TcpContext *context_;
     std::atomic_bool running_;
+    std::mutex abort_mutex_;
     std::unique_ptr<TcpIoPool> io_pool_;
     size_t num_io_threads_ = 1;
     bool enable_connection_pool_ = true;
@@ -251,6 +259,7 @@ class TcpTransport : public Transport {
     struct TcpWorkItem {
         Slice *slice = nullptr;
         bool use_v2 = false;
+        bool reuse_connection = true;
         std::function<void()> continuation;
         std::chrono::steady_clock::time_point admission_deadline;
 
@@ -263,6 +272,7 @@ class TcpTransport : public Transport {
         TcpWorkItem(TcpWorkItem &&other) noexcept
             : slice(other.slice),
               use_v2(other.use_v2),
+              reuse_connection(other.reuse_connection),
               continuation(std::move(other.continuation)),
               admission_deadline(other.admission_deadline) {
             other.slice = nullptr;
@@ -413,8 +423,6 @@ class TcpTransport : public Transport {
     // and a connected payload without a progress deadline can still stall a
     // lane indefinitely. Peer-generation recovery is also a separate phase.
 
-    std::shared_ptr<asio::ip::tcp::socket> getConnection(
-        const std::string &host, uint16_t port);
     void enqueuePooledTransfer(const std::string &logical_peer,
                                const ConnectionKey &key, TcpWorkItem work);
     static uint64_t requestGroupPumpLocked(PeerConnectionGroup &group);
@@ -497,9 +505,6 @@ class TcpTransport : public Transport {
     static void closeSocketNoThrow(
         const std::shared_ptr<asio::ip::tcp::socket> &socket) noexcept;
     void shutdownConnectionLanes();
-    void startTransferWithSocket(
-        TcpWorkItem work,
-        std::shared_ptr<asio::ip::tcp::socket> socket) noexcept;
 
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     friend bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;

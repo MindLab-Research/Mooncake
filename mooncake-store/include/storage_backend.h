@@ -165,7 +165,11 @@ enum class StorageBackendType {
     kBucket,
     kOffsetAllocator,
     kDistributed,
-    kNvmeKv
+    kNvmeKv,
+    // S3-compatible object storage through DistributedStorageBackend's
+    // logical-key mode. This is deliberately separate from kDistributed so
+    // FileStorage does not enter the descriptor-based DFS initialization path.
+    kS3ObjectStorage
 };
 
 static constexpr size_t kKB = 1024;
@@ -295,6 +299,8 @@ struct FileStorageConfig {
 
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
+    // Opt-in discovery of immutable objects written by independent S3 stores.
+    uint32_t s3_metadata_refresh_interval_seconds = 0;
 
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;

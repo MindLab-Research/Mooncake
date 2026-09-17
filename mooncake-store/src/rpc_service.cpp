@@ -4,6 +4,7 @@
 #include <functional>
 #include <string_view>
 #include <type_traits>
+#include <async_simple/coro/Collect.h>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -233,11 +234,12 @@ WrappedMasterService::BatchReplicaClear(
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-             ErrorCode>
-WrappedMasterService::GetReplicaListByRegex(const std::string& str,
-                                            const std::string& tenant_id) {
-    return execute_rpc(
+async_simple::coro::Lazy<tl::expected<
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+    ErrorCode>>
+WrappedMasterService::GetReplicaListByRegex(std::string str,
+                                            std::string tenant_id) {
+    auto result = execute_rpc(
         "GetReplicaListByRegex",
         [&] {
             return WithRequestTenant(
@@ -258,12 +260,52 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
             MasterMetricManager::instance()
                 .inc_get_replica_list_by_regex_failures();
         });
+    if (result) {
+        for (auto it = result->begin(); it != result->end();) {
+            auto check = co_await CheckDurableReadFence(it->first, tenant_id);
+            if (!check) {
+                if (check.error() != ErrorCode::OBJECT_NOT_FOUND)
+                    co_return tl::make_unexpected(check.error());
+                it = result->erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    co_return result;
 }
 
-tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaList(const std::string& key,
-                                     const std::string& tenant_id) {
-    return execute_rpc(
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+WrappedMasterService::CheckDurableReadFence(std::string key,
+                                            std::string tenant_id) {
+    auto routes = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& tenant) {
+            return master_service_.PrepareDurableRead(key, tenant);
+        });
+    if (!routes) co_return tl::make_unexpected(routes.error());
+    if (routes->empty()) co_return tl::expected<void, ErrorCode>{};
+    ErrorCode last_error = ErrorCode::RPC_FAIL;
+    for (auto& command : *routes) {
+        auto check = co_await RequestDurableProviderRead(std::move(command));
+        if (check) co_return tl::expected<void, ErrorCode>{};
+        last_error = check.error();
+        // Never turn a tombstone, permission denial or protocol mismatch into
+        // success by trying a peer. Only equivalent-scope availability failures
+        // permit failover; a successful check remains authoritative.
+        if (last_error != ErrorCode::RPC_FAIL &&
+            last_error != ErrorCode::RPC_TIMEOUT &&
+            last_error != ErrorCode::DFS_NETWORK_TIMEOUT &&
+            last_error != ErrorCode::DFS_SERVICE_UNAVAILABLE)
+            co_return tl::make_unexpected(last_error);
+    }
+    co_return tl::make_unexpected(last_error);
+}
+
+async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::GetReplicaList(std::string key, std::string tenant_id) {
+    auto result = execute_rpc(
         "GetReplicaList",
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
@@ -279,11 +321,19 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
         });
+    if (result) {
+        auto check = co_await CheckDurableReadFence(key, tenant_id);
+        if (!check) co_return tl::make_unexpected(check.error());
+        result->lease_ttl_ms =
+            master_service_.BoundDurableReadLease(result->lease_ttl_ms);
+    }
+    co_return result;
 }
 
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                          const std::string& tenant_id) {
+async_simple::coro::Lazy<
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
+WrappedMasterService::BatchGetReplicaList(std::vector<std::string> keys,
+                                          std::string tenant_id) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -301,6 +351,15 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                                        resolved_tenant_id);
         });
 
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) continue;
+        auto check = co_await CheckDurableReadFence(keys[i], tenant_id);
+        if (!check)
+            results[i] = tl::make_unexpected(check.error());
+        else
+            results[i]->lease_ttl_ms =
+                master_service_.BoundDurableReadLease(results[i]->lease_ttl_ms);
+    }
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
@@ -328,7 +387,7 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
-    return results;
+    co_return results;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -1555,6 +1614,61 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
     return master_service_.QuerySegments(segment);
 }
 
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+WrappedMasterService::RemoveDurable(std::string key, std::string tenant_id) {
+    auto tenant = ResolveRequestTenantId(tenant_id);
+    if (!tenant) co_return tl::make_unexpected(tenant.error());
+    auto plan = master_service_.PrepareDurableDelete(key, *tenant);
+    if (!plan) co_return tl::make_unexpected(plan.error());
+    if (plan->completed) co_return tl::expected<void, ErrorCode>{};
+    std::vector<
+        async_simple::coro::Lazy<tl::expected<DurableDeleteReceipt, ErrorCode>>>
+        requests;
+    requests.reserve(plan->providers.size());
+    for (const auto& route : plan->providers)
+        requests.push_back(
+            RequestDurableProviderDelete(route.endpoint, route.command));
+    // Bound connections while overlapping provider read-grace timers. Drain
+    // every started request before recording failure or committing metadata.
+    auto replies = co_await async_simple::coro::collectAllWindowed(
+        16, false, std::move(requests));
+    for (size_t i = 0; i < replies.size(); ++i) {
+        const auto& route = plan->providers[i];
+        auto receipt = replies[i].hasError()
+                           ? tl::expected<DurableDeleteReceipt, ErrorCode>(
+                                 tl::make_unexpected(ErrorCode::RPC_FAIL))
+                           : std::move(replies[i]).value();
+        ErrorCode result = receipt ? receipt->result : receipt.error();
+        if (receipt && (receipt->provider_id != route.command.provider_id ||
+                        receipt->operation_id != route.command.operation_id ||
+                        receipt->assignment_id != route.command.assignment_id ||
+                        receipt->namespace_identity !=
+                            route.command.storage_namespace.Identity()))
+            result = ErrorCode::INVALID_PARAMS;
+        if (result != ErrorCode::OK)
+            co_return master_service_.FinishDurableDelete(
+                key, *tenant, plan->operation_id, result, &*plan);
+    }
+    // Only this coordinator consumes replies from its assigned provider RPCs.
+    // There is deliberately no caller-controlled public Finish(OK) endpoint.
+    co_return master_service_.FinishDurableDelete(
+        key, *tenant, plan->operation_id, ErrorCode::OK, &*plan);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::ValidateDurableDeleteAssignment(
+    const DurableDeleteCommand& command) {
+    return master_service_.ValidateDurableDeleteAssignment(command);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::RegisterDurableDeleteProvider(
+    const UUID& client_id, const DurableObjectStorageNamespace& scope,
+    const std::string& provider_rpc_endpoint) {
+    return master_service_.RegisterDurableDeleteProvider(client_id, scope,
+                                                         provider_rpc_endpoint);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
@@ -1746,6 +1860,9 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
@@ -1813,6 +1930,14 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RemoveDurable>(
+        &wrapped_master_service);
+    server.register_handler<
+        &WrappedMasterService::ValidateDurableDeleteAssignment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterDurableDeleteProvider>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(

@@ -1,9 +1,13 @@
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "storage/distributed/object_storage_namespace.h"
 
 namespace mooncake {
 
@@ -103,6 +107,7 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class RealClient;
     friend class FileStoragePromotionTest;
     // TEST_F bodies are generated subclasses and do not inherit the fixture's
     // friendship, so the dangling-replica tests are friended by their
@@ -136,6 +141,18 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
+
+    // Provider-side primitive only. The coordinator must first fence Master
+    // writers and read leases; this method does not invalidate Master replicas.
+    tl::expected<void, ErrorCode> CheckDurableRead(
+        const DurableReadCommand& command);
+    tl::expected<void, ErrorCode> DeleteOffloadedObject(
+        const DurableDeleteCommand& command);
+    tl::expected<void, ErrorCode> FenceOffloadedObject(
+        const DurableDeleteCommand& command);
+    tl::expected<DurableObjectStorageNamespace, ErrorCode>
+    GetDurableDeleteNamespace() const;
+    tl::expected<void, ErrorCode> AdvertiseDurableDeleteNamespace();
 
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
@@ -233,10 +250,16 @@ class FileStorage {
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;
+    bool disk_segment_mounted_{false};
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
+    std::mutex metadata_scan_mutex_;
+    std::mutex durable_object_mutex_;
+    std::mutex metadata_refresh_mutex_;
+    std::condition_variable metadata_refresh_cv_;
+    std::thread metadata_refresh_thread_;
     std::atomic<bool> metadata_resync_pending_{false};
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
     // heartbeat -- which would otherwise re-mount the segment the drain just

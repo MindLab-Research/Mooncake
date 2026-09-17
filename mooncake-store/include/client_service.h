@@ -157,6 +157,7 @@ class Client {
      * @return Vector of QueryResult objects containing replicas and lease
      * timeouts
      */
+    tl::expected<int, ErrorCode> QueryReplicaStatus(const std::string& key);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
@@ -302,6 +303,7 @@ class Client {
      * @param force If true, skip lease and replication task checks
      * @return ErrorCode indicating success/failure
      */
+    tl::expected<void, ErrorCode> RemoveDurable(const ObjectKey& key);
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
                                          bool force = false);
 
@@ -470,6 +472,13 @@ class Client {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
+    tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
+        const DurableDeleteCommand& command);
+
+    tl::expected<void, ErrorCode> RegisterDurableDeleteProvider(
+        const DurableObjectStorageNamespace& scope,
+        const std::string& provider_rpc_endpoint);
+
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
     /**
@@ -714,6 +723,13 @@ class Client {
     }
 
     bool is_ping_healthy() const { return last_ping_success_.load(); }
+    bool is_transfer_healthy() const {
+        if (!transfer_engine_) return false;
+        auto* transport = transfer_engine_->getTransport(protocol_);
+        auto* tcp = transfer_engine_->getTransport("tcp");
+        return (!transport || transport->isAvailable()) &&
+               (!tcp || tcp->isAvailable());
+    }
 
     /**
      * @brief Get current frequency admission count for a key.

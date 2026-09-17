@@ -60,6 +60,14 @@ int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,
                             uint64_t mount_segment_size);
 
+// Additive setup for an embedded offload Store. Configure its backend through
+// MOONCAKE_OFFLOAD_* before setup; existing setup remains client-only.
+int mooncake_store_setup_with_offload(
+    mooncake_store_t store, const char *local_hostname,
+    const char *metadata_server, uint64_t global_segment_size,
+    uint64_t local_buffer_size, const char *protocol, const char *device_name,
+    const char *master_server_addr, const char *offload_path);
+
 int mooncake_store_health_check(mooncake_store_t store);
 
 // ---------------------------------------------------------------------------
@@ -97,6 +105,12 @@ int mooncake_store_batch_get_into(mooncake_store_t store, const char **keys,
 
 int mooncake_store_is_exist(mooncake_store_t store, const char *key);
 
+// COMPLETE replica bitmask: 1 = memory, 2 = offloaded; negative = error.
+// Bit 2 means cloud persistence only when the advertised Store uses S3.
+// A Put acknowledgment alone does not imply bit 2. Immutable keys are required
+// when using this query as a publication gate across independent Masters.
+int mooncake_store_get_replica_status(mooncake_store_t store, const char *key);
+
 int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
                                   size_t count, int *results_out);
 
@@ -110,6 +124,14 @@ int mooncake_store_get_hostname(mooncake_store_t store, char *buf_out,
 // ---------------------------------------------------------------------------
 
 int mooncake_store_remove(mooncake_store_t store, const char *key, int force);
+
+// Permanent object-storage deletion through the owning Master/provider.
+// Requires a v3 provider and durable deletion journal; never forces a lease.
+// Returns 0 only after durable completion, negative ErrorCode otherwise.
+// OBJECT_HAS_LEASE is retryable. Missing local metadata is not proof of cloud
+// absence. Completed journal operations are idempotent, including after
+// restart.
+int mooncake_store_remove_durable(mooncake_store_t store, const char *key);
 
 int64_t mooncake_store_remove_by_regex(mooncake_store_t store,
                                        const char *pattern, int force);

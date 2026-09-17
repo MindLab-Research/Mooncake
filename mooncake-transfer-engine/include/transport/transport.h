@@ -429,6 +429,16 @@ class Transport {
     // recover per-request status after a grouped task fails.
     virtual bool supportsGroupedScatter() const { return false; }
 
+    // A poisoned transport rejects new work and requires client recreation.
+    virtual bool isAvailable() const { return true; }
+
+    // Abort this transport's batch tasks only after it has stopped accessing
+    // their buffers. Implementations may poison the whole transport. Returning
+    // NotImplemented does NOT establish quiescence and must not release memory.
+    virtual Status abortBatch(BatchID) {
+        return Status::NotImplemented("transport cannot safely abort batches");
+    }
+
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.
     /// @return Return 1 on completed (either success or failure); 0 if still in

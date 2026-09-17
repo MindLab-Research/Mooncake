@@ -21,6 +21,8 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(uint32_t, MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS);
     MC_DEFINE_ENV_VAR(uint32_t,
+                      MOONCAKE_OFFLOAD_S3_METADATA_REFRESH_INTERVAL_SECONDS);
+    MC_DEFINE_ENV_VAR(uint32_t,
                       MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS);
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS);
 
@@ -98,6 +100,7 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 struct ReplicaSelectionEnvironmentVariables {
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_REQUIRED_OFFLOAD_ENDPOINT);
 };
 
 #undef MC_DEFINE_ENV_VAR

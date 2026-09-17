@@ -117,9 +117,30 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 // replicas in any order, so we always scan. When scoring is enabled and there
 // are multiple remote MEMORY replicas, the best-scoring one is chosen instead
 // of the first encountered.
+inline const std::string &RequiredOffloadEndpoint() {
+    static const auto config = ReplicaSelectionConfig::FromEnvironment();
+    return config.required_offload_endpoint;
+}
+
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
+    const std::unordered_set<std::string> &local_endpoints,
+    const std::string &required_offload_endpoint = RequiredOffloadEndpoint()) {
+    // Explicit OSS deployments may require reads through their regional
+    // provider. Never silently use a remote memory replica if that provider
+    // has not registered this object yet. This selects an existing Master
+    // descriptor; it does not construct a route or bypass read/delete fences.
+    if (!required_offload_endpoint.empty()) {
+        for (const auto &r : replicas) {
+            if (r.status == ReplicaStatus::COMPLETE &&
+                r.is_local_disk_replica() &&
+                r.get_local_disk_descriptor().transport_endpoint ==
+                    required_offload_endpoint) {
+                return &r;
+            }
+        }
+        return nullptr;
+    }
     const Replica::Descriptor *first_memory = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {

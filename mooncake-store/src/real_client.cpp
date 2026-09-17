@@ -723,6 +723,8 @@ RealClient::RealClient() {
 }
 
 RealClient::~RealClient() {
+    if (durable_delete_rpc_handler_)
+        durable_delete_rpc_handler_->StopAndDrain();
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
         offload_rpc_server_.reset();
@@ -1107,6 +1109,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        durable_delete_rpc_handler_ =
+            std::make_unique<DurableDeleteRpcHandler>();
+        offload_rpc_server_
+            ->register_handler<&DurableDeleteRpcHandler::Execute>(
+                durable_delete_rpc_handler_.get());
+        offload_rpc_server_
+            ->register_handler<&DurableDeleteRpcHandler::CheckRead>(
+                durable_delete_rpc_handler_.get());
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -1135,6 +1145,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "file storage init failed with error: "
                        << init_result.error();
             return init_result;
+        }
+        if (durable_delete_rpc_handler_) {
+            durable_delete_rpc_handler_->SetFenceExecutor(
+                [storage = file_storage_](const DurableDeleteCommand &command) {
+                    return storage->FenceOffloadedObject(command);
+                });
+            durable_delete_rpc_handler_->SetReadExecutor(
+                [storage = file_storage_](const DurableReadCommand &command) {
+                    return storage->CheckDurableRead(command);
+                });
+            durable_delete_rpc_handler_->SetExecutor(
+                [storage = file_storage_](const DurableDeleteCommand &command)
+                    -> tl::expected<DurableDeleteReceipt, ErrorCode> {
+                    const auto result = storage->DeleteOffloadedObject(command);
+                    return DurableDeleteReceipt{
+                        command.provider_id, command.operation_id,
+                        command.assignment_id,
+                        command.storage_namespace.Identity(),
+                        result ? ErrorCode::OK : result.error()};
+                });
         }
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
@@ -1365,6 +1395,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
 
+    if (durable_delete_rpc_handler_)
+        durable_delete_rpc_handler_->StopAndDrain();
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
@@ -1862,6 +1894,7 @@ int RealClient::health_check() {
     if (closed_.load()) return HC_NOT_INITIALIZED;
     if (!client_) return HC_NOT_INITIALIZED;
     if (!client_->is_ping_healthy()) return HC_MASTER_UNREACHABLE;
+    if (!client_->is_transfer_healthy()) return HC_TRANSFER_UNAVAILABLE;
     return HC_HEALTHY;
 }
 
@@ -1888,6 +1921,9 @@ int RealClient::start_http_server(int port) {
                     break;
                 case HC_MASTER_UNREACHABLE:
                     status_str = "master_unreachable";
+                    break;
+                case HC_TRANSFER_UNAVAILABLE:
+                    status_str = "transfer_unavailable";
                     break;
                 default:
                     status_str = "unknown";
@@ -2248,6 +2284,11 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
 
 int RealClient::remove(const std::string &key, bool force) {
     return to_py_ret(remove_internal(key, force));
+}
+
+int RealClient::remove_durable(const std::string &key) {
+    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->RemoveDurable(key));
 }
 
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
@@ -4046,6 +4087,12 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     sum_positive_ranges(ret), latency_us);
             });
     return results;
+}
+
+int RealClient::replica_status(const std::string &key) {
+    if (!client_) return toInt(ErrorCode::INVALID_PARAMS);
+    auto result = client_->QueryReplicaStatus(key);
+    return result ? *result : toInt(result.error());
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(

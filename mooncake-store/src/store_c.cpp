@@ -118,6 +118,34 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
     }
 }
 
+int mooncake_store_setup_with_offload(
+    mooncake_store_t store, const char *local_hostname,
+    const char *metadata_server, uint64_t global_segment_size,
+    uint64_t local_buffer_size, const char *protocol, const char *device_name,
+    const char *master_server_addr, const char *offload_path) {
+    if (!store) return -1;
+    try {
+        return as_client(store)->setup_real(
+            c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
+            global_segment_size, local_buffer_size, c_str_or(protocol, "tcp"),
+            c_str_or(device_name, ""),
+            c_str_or(master_server_addr, "127.0.0.1:50051"), nullptr, "", true,
+            c_str_or(offload_path, ""));
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_get_replica_status(mooncake_store_t store, const char *key) {
+    if (!store || !key) return -1;
+    try {
+        // Observing durability must not grant read leases or block eviction.
+        return as_client(store)->replica_status(key);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,
                             uint64_t mount_segment_size) {
@@ -312,6 +340,15 @@ int mooncake_store_remove(mooncake_store_t store, const char *key, int force) {
     if (!store || !key) return -1;
     try {
         return as_client(store)->remove(key, force != 0);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_remove_durable(mooncake_store_t store, const char *key) {
+    if (!store || !key) return -1;
+    try {
+        return as_client(store)->remove_durable(key);
     } catch (...) {
         return -1;
     }

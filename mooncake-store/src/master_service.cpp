@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cctype>
@@ -286,6 +285,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (config.enable_snapshot_restore) {
         RestoreState();
+    }
+    // Overlay canonical journal AFTER every snapshot/fallback attempt and
+    // BEFORE background workers or the RPC service can admit requests.
+    if (!config.durable_delete_journal_path.empty()) {
+        if (enable_ha_) {
+            throw std::invalid_argument(
+                "Local deletion journal cannot serve HA");
+        }
+        durable_delete_journal_ = std::make_unique<DurableDeleteJournal>(
+            config.durable_delete_journal_path);
+        RecoverDurableDeletions();
     }
     if (enable_multi_tenants_) {
         LoadTenantQuotaPoliciesFromStoreOrThrow();
@@ -2724,6 +2734,12 @@ void MasterService::ClearStaleHandles(
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
+                // Retain provider routing and administrative evidence until
+                // durable deletion completes, even if its provider is down.
+                if (it->second.durable_delete_pending) {
+                    ++it;
+                    continue;
+                }
                 const auto cleanup_plan =
                     BuildStaleHandleCleanupPlan(it->second, is_stale);
                 if (!cleanup_plan.removed_ids.empty()) {
@@ -3566,6 +3582,7 @@ auto MasterService::BatchReplicaClear(
         }
 
         auto& metadata = accessor.Get();
+        if (metadata.durable_delete_pending) continue;
         const auto previous_kv_media = KvMediaSnapshot(metadata);
 
         // Security check: Ensure the requesting client owns the object.
@@ -3783,6 +3800,7 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
+    if (metadata.durable_delete_pending) return false;
     return metadata.HasReplica(
         [this](const Replica& replica) { return IsReplicaReadable(replica); });
 }
@@ -3817,7 +3835,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             continue;
         }
         for (const auto& [key, metadata] : tenant_it->second.metadata) {
-            if (std::regex_search(key, pattern)) {
+            if (!metadata.durable_delete_pending &&
+                std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     [this](const Replica& replica) {
@@ -3863,6 +3882,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         const auto& metadata = accessor.Get();
+        if (metadata.durable_delete_pending) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
 
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
@@ -4037,7 +4059,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 const auto& tenant_state = tenant_it->second;
                 const auto metadata_it = tenant_state.metadata.find(key);
                 if (metadata_it == tenant_state.metadata.end() ||
-                    !metadata_it->second.IsValid()) {
+                    !metadata_it->second.IsValid() ||
+                    metadata_it->second.durable_delete_pending) {
                     VLOG(1) << "key=" << key << ", info=object_not_found";
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -4600,6 +4623,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(admission_result.error());
             }
 
+            if (tenant_state.durable_deletions.contains(key)) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
                 auto cleanup_plan =
@@ -4693,6 +4720,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -4870,6 +4900,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     }
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         accessor.Create(
             client_id,
@@ -4885,7 +4918,11 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     }
 
     const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        metadata.HasReplica([client_id](const Replica& rep) {
+            return rep.is_local_disk_replica() &&
+                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
+                       client_id;
+        });
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
@@ -4963,6 +5000,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -5249,6 +5289,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(admission_result.error());
             }
 
+            if (tenant_state.durable_deletions.contains(key)) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
             auto it = tenant_state.metadata.find(key);
 
             // --- Step 0: stale handle cleanup ---
@@ -5807,6 +5851,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         }
     }
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -6241,6 +6288,9 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     }
 
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -6587,11 +6637,452 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
+void MasterService::RecoverDurableDeletions() {
+    if (!durable_delete_journal_) return;
+    const auto records = durable_delete_journal_->Records();
+    std::map<std::pair<std::string, std::string>,
+             const DurableDeleteJournal::Record*>
+        canonical;
+    for (const auto& record : records) {
+        canonical[{record.tenant, record.key}] = &record;
+    }
+    for (const auto& shard : metadata_shards_) {
+        for (const auto& [tenant, state] : shard.tenants) {
+            for (const auto& [key, deletion] : state.durable_deletions) {
+                auto found = canonical.find({tenant.value(), key});
+                if (found == canonical.end() ||
+                    found->second->operation !=
+                        UuidToString(deletion.operation_id) ||
+                    found->second->namespace_identity !=
+                        deletion.namespace_identity ||
+                    (deletion.completed && !found->second->completed)) {
+                    throw std::runtime_error(
+                        "Snapshot deletion missing from canonical journal");
+                }
+            }
+        }
+    }
+    for (const auto& record : records) {
+        const TenantId tenant(record.tenant);
+        UUID operation;
+        if (!tenant.IsValid() || !StringToUuid(record.operation, operation)) {
+            throw std::runtime_error("Invalid canonical deletion identity");
+        }
+        MetadataShardAccessorRW shard(this, getShardIndex(tenant, record.key));
+        auto& state = GetOrCreateTenantState(shard.get(), tenant);
+        const auto old = state.durable_deletions.find(record.key);
+        if (old != state.durable_deletions.end() &&
+            (old->second.operation_id != operation ||
+             old->second.namespace_identity != record.namespace_identity ||
+             (old->second.completed && !record.completed))) {
+            throw std::runtime_error(
+                "Snapshot conflicts with deletion journal");
+        }
+        state.durable_deletions[record.key] = {operation, record.completed,
+                                               record.namespace_identity};
+        auto& restored = state.durable_deletions.at(record.key);
+        restored.reader_grace_ms = record.reader_grace_ms;
+        if (record.reader_grace_ms && !record.completed)
+            restored.recovery_not_before =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(*record.reader_grace_ms);
+        auto metadata = state.metadata.find(record.key);
+        if (metadata != state.metadata.end()) {
+            if (record.completed) {
+                EraseMetadata(state, metadata, tenant, QuotaEraseMode::kFull,
+                              &shard);
+            } else {
+                metadata->second.durable_delete_pending = true;
+            }
+        }
+    }
+}
+
+uint64_t MasterService::BoundDurableReadLease(uint64_t ttl_ms) const {
+    return durable_delete_journal_ ? std::min(ttl_ms, kMaxDurableReadLeaseMs)
+                                   : ttl_ms;
+}
+
+tl::expected<std::vector<DurableReadCommand>, ErrorCode>
+MasterService::PrepareDurableRead(const std::string& key,
+                                  const TenantId& tenant_id) {
+    if (key.empty() || !tenant_id.IsValid())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (!durable_delete_journal_) return std::vector<DurableReadCommand>{};
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    std::shared_lock snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRO accessor(this, object_id);
+    if (!accessor.Exists())
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    if (accessor.IsDurableDeleteFenced())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    std::lock_guard lock(durable_provider_mutex_);
+    std::vector<DurableReadCommand> routes;
+    std::optional<DurableObjectStorageNamespace> scope;
+    // Scope the cloud check to this object's durable owners. Unrelated legacy
+    // namespaces must not disable v3 reads, nor should a provider restart block
+    // memory-only objects. Unknown offload ownership remains fail closed.
+    for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        const auto owner = replica.get_local_disk_client_id();
+        if (!owner) continue;
+        const auto provider = durable_providers_.find(*owner);
+        if (provider == durable_providers_.end())
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        const auto& candidate = provider->second;
+        if (candidate.protocol_version != kDurableReadFenceProtocolVersion)
+            continue;
+        if (scope && *scope != candidate)
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        scope = candidate;
+    }
+    if (!scope) return routes;
+    for (const auto& [id, candidate] : durable_providers_) {
+        if (candidate != *scope) continue;
+        const auto endpoint = durable_provider_endpoints_.find(id);
+        if (endpoint != durable_provider_endpoints_.end() &&
+            local_ssd_manager_.GetUsage(id))
+            routes.push_back({id, object_id.tenant_id.value(), key, candidate,
+                              endpoint->second});
+    }
+    if (routes.empty())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    // Every returned route checks the same physical namespace. The RPC layer
+    // may try another route only after a transport/service availability error.
+    return routes;
+}
+
+tl::expected<void, ErrorCode> MasterService::RegisterDurableDeleteProvider(
+    const UUID& client_id, const DurableObjectStorageNamespace& scope,
+    const std::string& provider_rpc_endpoint) {
+    if (!scope.IsValid() || provider_rpc_endpoint.empty() ||
+        provider_rpc_endpoint.size() > 512 ||
+        provider_rpc_endpoint.find_first_of("/@?# \r\n\t") !=
+            std::string::npos ||
+        provider_rpc_endpoint.find('\0') != std::string::npos ||
+        provider_rpc_endpoint.find(':') == std::string::npos)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::shared_lock snapshot_lock(snapshot_mutex_);
+    if (!local_ssd_manager_.GetUsage(client_id))
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    if (scope.protocol_version == kDurableReadFenceProtocolVersion &&
+        (!durable_delete_journal_ || enable_ha_))
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    std::lock_guard lock(durable_provider_mutex_);
+    const auto old = durable_providers_.find(client_id);
+    const auto route = durable_provider_endpoints_.find(client_id);
+    if (old != durable_providers_.end() &&
+        (old->second != scope || route == durable_provider_endpoints_.end() ||
+         route->second != provider_rpc_endpoint))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    durable_providers_.emplace(client_id, scope);
+    durable_provider_endpoints_.emplace(client_id, provider_rpc_endpoint);
+    return {};
+}
+
+tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
+    const std::string& key, const TenantId& tenant_id) {
+    if (key.empty() || !tenant_id.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // An HA fence must be in the durable log before a provider may delete.
+    // Until that recovery path is implemented, refuse rather than acknowledge
+    // a volatile fence that a failover could lose.
+    if (enable_ha_ || !durable_delete_journal_) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    [[maybe_unused]] auto operation_lock =
+        AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
+    std::shared_lock snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        const auto& state = accessor.GetTenantState().durable_deletions.at(key);
+        if (state.completed) return state.operation_id;
+        if (state.reader_grace_ms) {
+            // Reconfirm durability after an uncertain first append. The
+            // original admission already excluded writers and offload tasks;
+            // the permanent fence rejects new work and delayed discovery.
+            if (!durable_delete_journal_->Commit(
+                    {object_id.tenant_id.value(), key,
+                     UuidToString(state.operation_id), false,
+                     state.namespace_identity, state.reader_grace_ms}))
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            if (std::chrono::steady_clock::now() < state.recovery_not_before ||
+                (accessor.Exists() && !accessor.Get().IsLeaseExpired()))
+                return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            std::lock_guard provider_lock(durable_provider_mutex_);
+            if (accessor.Exists()) {
+                for (const auto& replica : accessor.Get().GetAllReplicas()) {
+                    const auto owner = replica.get_local_disk_client_id();
+                    if (!owner) continue;
+                    const auto registered = durable_providers_.find(*owner);
+                    if (registered != durable_providers_.end() &&
+                        registered->second.Identity() !=
+                            state.namespace_identity)
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+            }
+            const bool routed = std::any_of(
+                durable_providers_.begin(), durable_providers_.end(),
+                [&](const auto& provider) {
+                    return provider.second.Identity() ==
+                               state.namespace_identity &&
+                           provider.second.protocol_version ==
+                               kDurableReadFenceProtocolVersion &&
+                           local_ssd_manager_.GetUsage(provider.first)
+                               .has_value();
+                });
+            if (!routed) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+            return state.operation_id;
+        }
+    }
+    if (!accessor.Exists()) {
+        // A missing key still requires a provider route and persistent intent
+        // lookup. Never convert this into a successful durable deletion.
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& tenant_state = accessor.GetTenantState();
+    if (!metadata.AllReplicas(&Replica::fn_is_completed) ||
+        accessor.InProcessing()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    if (accessor.HasReplicationTask() ||
+        tenant_state.offloading_tasks.contains(key) ||
+        tenant_state.promotion_tasks.contains(key) ||
+        tenant_state.dynamic_replication_pending.contains(key) ||
+        metadata.HasReplica(
+            [](const Replica& replica) { return replica.is_busy(); })) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    std::string namespace_identity;
+    {
+        std::lock_guard provider_lock(durable_provider_mutex_);
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            const auto owner = replica.get_local_disk_client_id();
+            if (!owner) continue;
+            const auto provider = durable_providers_.find(*owner);
+            if (provider == durable_providers_.end() ||
+                !local_ssd_manager_.GetUsage(*owner) ||
+                provider->second.protocol_version !=
+                    kDurableReadFenceProtocolVersion) {
+                return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+            }
+            if (object_id.tenant_id.MakeScopedKey(key).size() >
+                provider->second.max_scoped_key_bytes) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const auto identity = provider->second.Identity();
+            if (!namespace_identity.empty() && namespace_identity != identity)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            namespace_identity = identity;
+        }
+    }
+    auto found = tenant_state.durable_deletions.find(key);
+    if (found == tenant_state.durable_deletions.end()) {
+        found = tenant_state.durable_deletions
+                    .emplace(
+                        key,
+                        TenantState::DurableDeleteState{
+                            .operation_id = generate_uuid(),
+                            .namespace_identity = namespace_identity,
+                            .reader_grace_ms = metadata.RemainingReadLeaseMs()})
+                    .first;
+    }
+    if (found->second.namespace_identity != namespace_identity)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    // A failed/uncertain append still fences this running process. Never allow
+    // provider deletion until retry confirms that the fence is durable.
+    const auto previous_media = KvMediaSnapshot(metadata);
+    metadata.durable_delete_pending = true;
+    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_media);
+    if (!durable_delete_journal_->Commit(
+            {object_id.tenant_id.value(), key,
+             UuidToString(found->second.operation_id), false,
+             found->second.namespace_identity,
+             found->second.reader_grace_ms})) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    // Stop lease renewal first; existing readers may finish while callers
+    // retry. No metadata lock is retained across a provider RPC or a wait.
+    if (!metadata.IsLeaseExpired()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    }
+    return found->second.operation_id;
+}
+
+tl::expected<DurableDeletePlan, ErrorCode> MasterService::PrepareDurableDelete(
+    const std::string& key, const TenantId& tenant) {
+    auto begun = BeginDurableDelete(key, tenant);
+    if (!begun) return tl::make_unexpected(begun.error());
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant);
+    auto operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+    std::shared_lock snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.IsDurableDeleteFenced())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto& state = accessor.GetTenantState().durable_deletions.at(key);
+    DurableDeletePlan plan{state.operation_id, state.completed, {}};
+    if (state.completed) return plan;
+    if ((!accessor.Exists() && !state.reader_grace_ms) ||
+        std::chrono::steady_clock::now() < state.recovery_not_before ||
+        (accessor.Exists() && !accessor.Get().IsLeaseExpired()))
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    std::lock_guard provider_lock(durable_provider_mutex_);
+    std::erase_if(state.assignments, [this](const auto& entry) {
+        return !durable_providers_.contains(entry.first);
+    });
+    for (const auto& [provider_id, scope] : durable_providers_) {
+        if (scope.Identity() != state.namespace_identity) continue;
+        auto route = durable_provider_endpoints_.find(provider_id);
+        if (route == durable_provider_endpoints_.end() ||
+            !local_ssd_manager_.GetUsage(provider_id))
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        auto [assignment, inserted] =
+            state.assignments.try_emplace(provider_id, generate_uuid());
+        plan.providers.push_back(
+            {route->second,
+             {provider_id, state.operation_id, assignment->second,
+              object_id.tenant_id.value(), key, scope, route->second}});
+    }
+    if (plan.providers.empty())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    return plan;
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateDurableDeleteAssignment(
+    const DurableDeleteCommand& command) {
+    const TenantId tenant(command.tenant_id);
+    if (!tenant.IsValid() || command.key.empty() ||
+        !command.storage_namespace.IsValid())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto object_id = MakeObjectIdentityForRequest(command.key, tenant);
+    if (command.tenant_id != object_id.tenant_id.value())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto operation_lock =
+        AcquireObjectOperationLock(object_id.tenant_id, command.key);
+    std::shared_lock snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRO accessor(this, object_id);
+    const auto* tenant_state = accessor.GetTenantState();
+    if (!tenant_state) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto deletion = tenant_state->durable_deletions.find(command.key);
+    if (deletion == tenant_state->durable_deletions.end())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto& state = deletion->second;
+    const auto assignment = state.assignments.find(command.provider_id);
+    if (state.completed || state.operation_id != command.operation_id ||
+        state.namespace_identity != command.storage_namespace.Identity() ||
+        assignment == state.assignments.end() ||
+        assignment->second != command.assignment_id)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if ((!accessor.Exists() && !state.reader_grace_ms) ||
+        std::chrono::steady_clock::now() < state.recovery_not_before ||
+        (accessor.Exists() && !accessor.Get().IsLeaseExpired()))
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    std::lock_guard provider_lock(durable_provider_mutex_);
+    const auto provider = durable_providers_.find(command.provider_id);
+    const auto endpoint = durable_provider_endpoints_.find(command.provider_id);
+    if (endpoint == durable_provider_endpoints_.end() ||
+        endpoint->second != command.provider_endpoint ||
+        provider == durable_providers_.end() ||
+        provider->second != command.storage_namespace ||
+        !local_ssd_manager_.GetUsage(command.provider_id))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::FinishDurableDelete(
+    const std::string& key, const TenantId& tenant_id, const UUID& operation_id,
+    ErrorCode provider_result, const DurableDeletePlan* plan) {
+    if (key.empty() || !tenant_id.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    [[maybe_unused]] auto operation_lock =
+        AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
+    std::shared_lock snapshot_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto& state = accessor.GetTenantState().durable_deletions.at(key);
+    if (state.operation_id != operation_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (state.completed) return {};
+    if (provider_result != ErrorCode::OK) {
+        // Preserve both metadata and the fence for an idempotent retry.
+        return tl::make_unexpected(provider_result);
+    }
+    if (!accessor.Exists() && !state.reader_grace_ms) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    if (std::chrono::steady_clock::now() < state.recovery_not_before ||
+        (accessor.Exists() && !accessor.Get().IsLeaseExpired())) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    }
+    if (accessor.Exists() &&
+        (!accessor.Get().AllReplicas(&Replica::fn_is_completed) ||
+         accessor.Get().HasReplica(
+             [](const Replica& replica) { return replica.is_busy(); }))) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    // Hold the provider registry through acknowledgement. A membership or
+    // endpoint change while RPCs were in flight requires a fresh drain plan.
+    std::unique_lock provider_lock(durable_provider_mutex_);
+    if (plan) {
+        if (plan->operation_id != operation_id)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        size_t members = 0;
+        for (const auto& [provider_id, scope] : durable_providers_) {
+            if (scope.Identity() != state.namespace_identity) continue;
+            ++members;
+            auto expected = std::find_if(
+                plan->providers.begin(), plan->providers.end(),
+                [&](const auto& route) {
+                    return route.command.provider_id == provider_id;
+                });
+            auto endpoint = durable_provider_endpoints_.find(provider_id);
+            auto assignment = state.assignments.find(provider_id);
+            if (expected == plan->providers.end() ||
+                endpoint == durable_provider_endpoints_.end() ||
+                expected->endpoint != endpoint->second ||
+                assignment == state.assignments.end() ||
+                expected->command.assignment_id != assignment->second ||
+                !local_ssd_manager_.GetUsage(provider_id))
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        if (members == 0 || members != plan->providers.size())
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!durable_delete_journal_ ||
+        !durable_delete_journal_->Commit(
+            {object_id.tenant_id.value(), key, UuidToString(operation_id), true,
+             state.namespace_identity, state.reader_grace_ms})) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    state.completed = true;
+    state.assignments.clear();
+    if (accessor.Exists()) accessor.Erase();
+    return {};
+}
+
 auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -6677,7 +7168,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
         for (auto it = tenant_state.metadata.begin();
              it != tenant_state.metadata.end();) {
-            if (std::regex_search(it->first, pattern)) {
+            if (!it->second.durable_delete_pending &&
+                std::regex_search(it->first, pattern)) {
                 if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
@@ -6800,7 +7292,8 @@ long MasterService::RemoveAll(bool force) {
                     if (track_cleared_tenants) {
                         tenants_seen.insert(tenant_it->first.value());
                     }
-                    if ((force || it->second.IsLeaseExpired(now)) &&
+                    if (!it->second.durable_delete_pending &&
+                        (force || it->second.IsLeaseExpired(now)) &&
                         it->second.AllReplicas(&Replica::fn_is_completed) &&
                         !tenant_state.replication_tasks.contains(it->first)) {
                         auto mem_rep_count = it->second.CountReplicas(
@@ -6936,7 +7429,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
                 saw_any_object = true;
-                if ((force || it->second.IsLeaseExpired(now)) &&
+                if (!it->second.durable_delete_pending &&
+                    (force || it->second.IsLeaseExpired(now)) &&
                     it->second.AllReplicas(&Replica::fn_is_completed) &&
                     !tenant_state.replication_tasks.contains(it->first)) {
                     it->second.VisitReplicas(
@@ -7061,6 +7555,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
             auto& tenant_state = tenant_it->second;
+            if (tenant_state.durable_deletions.contains(key)) {
+                results[original_idx] = tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                continue;
+            }
             auto it = tenant_state.metadata.find(key);
 
             if (it == tenant_state.metadata.end()) {
@@ -7525,6 +8024,9 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
+        std::lock_guard provider_lock(durable_provider_mutex_);
+        durable_providers_.erase(client_id);
+        durable_provider_endpoints_.erase(client_id);
     }
     if (!reported_capacity) {
         // Idempotent, the same way MountLocalDiskSegment treats an
@@ -7695,6 +8197,11 @@ auto MasterService::NotifyOffloadSuccess(
             const bool segment_mounted =
                 !enable_offload_ || HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
+            if (accessor.IsDurableDeleteFenced()) {
+                // A delayed discovery/completion cannot revive this immutable
+                // key. Continue so other objects in the batch can register.
+                continue;
+            }
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
@@ -7723,8 +8230,14 @@ auto MasterService::NotifyOffloadSuccess(
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
-                    } else if (!obj_metadata.HasReplica(
-                                   &Replica::fn_is_local_disk_replica)) {
+                    } else if (!obj_metadata.HasReplica([client_id](
+                                                            const Replica&
+                                                                rep) {
+                                   return rep.is_local_disk_replica() &&
+                                          rep.get_descriptor()
+                                                  .get_local_disk_descriptor()
+                                                  .client_id == client_id;
+                               })) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
@@ -8689,6 +9202,9 @@ MasterService::SubmitReplicaActionProposalLocked(
     const UUID proposal_id = proposal.proposal_id;
 
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -8866,7 +9382,7 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // record. Safe to call here because GetReplicaList has already released
     // its RO accessor.
     MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
+    if (!accessor.Exists() || accessor.IsDurableDeleteFenced()) {
         return PromotionQueueResult::kNotFound;
     }
     auto& metadata = accessor.Get();
@@ -9005,6 +9521,9 @@ auto MasterService::PromotionAllocStart(
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.IsDurableDeleteFenced()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -11209,7 +11728,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                  it != tenant_state.metadata.end() &&
                  shard_evicted_count < ideal_evict_num;) {
                 auto& metadata = it->second;
-                if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
+                if (metadata.durable_delete_pending ||
+                    metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                     IsSoftPinActive(metadata, now)) {
                     ++it;
                     continue;
@@ -11472,6 +11992,11 @@ void MasterService::ClientMonitorFunc() {
             }
             for (const auto& client_id : expired_clients) {
                 auto capacity = local_ssd_manager_.UnregisterClient(client_id);
+                {
+                    std::lock_guard provider_lock(durable_provider_mutex_);
+                    durable_providers_.erase(client_id);
+                    durable_provider_endpoints_.erase(client_id);
+                }
                 if (capacity && *capacity > 0) {
                     MasterMetricManager::instance().dec_total_file_capacity(
                         *capacity);
@@ -11737,7 +12262,7 @@ MasterService::MetadataSerializer::Serialize() {
     // 1. Serialize metadata shards
     packer.pack("shards");
 
-    // First count shards that have actual metadata entries.
+    // Count shards with metadata or permanent deletion fences.
     // A shard may have empty tenants left after eviction erased all
     // metadata but didn't clean up the tenant map; using metadata_count
     // (not tenants.empty()) ensures the count matches the skip logic below.
@@ -11745,7 +12270,7 @@ MasterService::MetadataSerializer::Serialize() {
     for (size_t i = 0; i < kNumShards; ++i) {
         size_t metadata_count = 0;
         for (const auto& [tid, ts] : service_->metadata_shards_[i].tenants) {
-            metadata_count += ts.metadata.size();
+            metadata_count += ts.metadata.size() + ts.durable_deletions.size();
         }
         if (metadata_count > 0) {
             valid_shards++;
@@ -11759,14 +12284,14 @@ MasterService::MetadataSerializer::Serialize() {
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         const auto& shard = service_->metadata_shards_[shard_idx];
 
-        // Skip shards with no actual metadata entries.
+        // Skip shards with neither metadata nor deletion fences.
         // A shard may have empty tenants left after eviction erased all
         // metadata but didn't clean up the tenant map; serializing those
         // would produce an entry that deserialization never recreates,
         // breaking the snapshot round-trip comparison.
         size_t metadata_count = 0;
         for (const auto& [tid, ts] : shard.tenants) {
-            metadata_count += ts.metadata.size();
+            metadata_count += ts.metadata.size() + ts.durable_deletions.size();
         }
         if (metadata_count == 0) {
             continue;
@@ -11973,11 +12498,16 @@ void MasterService::MetadataSerializer::Reset() {
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
                                                   MsgpackPacker& packer) const {
-    // MetadataShard format: map with "metadata" field
-    packer.pack_map(1);
+    size_t delete_count = 0;
+    for (const auto& [tenant_id, state] : shard.tenants) {
+        delete_count += state.durable_deletions.size();
+    }
+    packer.pack_map(delete_count ? 2 : 1);
 
-    // Serialize metadata
-    packer.pack("metadata");
+    // Preserve legacy bytes when no fence exists. A fenced shard uses a new
+    // required metadata field so an older decoder rejects it rather than
+    // silently ignoring deletion state and restoring readable objects.
+    packer.pack(delete_count ? "metadata_with_durable_deletes_v2" : "metadata");
     size_t metadata_count = 0;
     for (const auto& [tenant_id, tenant_state] : shard.tenants) {
         metadata_count += tenant_state.metadata.size();
@@ -12021,6 +12551,32 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
         }
     }
 
+    if (delete_count) {
+        packer.pack("durable_deletes_v2");
+        packer.pack_array(delete_count);
+        using DeleteEntry = std::tuple<std::string, std::string,
+                                       const TenantState::DurableDeleteState*>;
+        std::vector<DeleteEntry> entries;
+        for (const auto& [tenant_id, state] : shard.tenants) {
+            for (const auto& [key, deletion] : state.durable_deletions) {
+                entries.emplace_back(tenant_id.value(), key, &deletion);
+            }
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) {
+                      return std::tie(std::get<0>(a), std::get<1>(a)) <
+                             std::tie(std::get<0>(b), std::get<1>(b));
+                  });
+        for (const auto& [tenant_id, key, deletion] : entries) {
+            packer.pack_array(5);
+            packer.pack(tenant_id);
+            packer.pack(key);
+            packer.pack(UuidToString(deletion->operation_id));
+            packer.pack(deletion->completed);
+            packer.pack(deletion->namespace_identity);
+        }
+    }
+
     return {};
 }
 
@@ -12033,16 +12589,40 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
     }
 
     const msgpack::object* metadata_array = nullptr;
+    const msgpack::object* deletes_array = nullptr;
+    bool fenced_format = false;
 
     // Extract fields from shard map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
         const auto& key_obj = obj.via.map.ptr[i].key;
         if (key_obj.type == msgpack::type::STR) {
             std::string field_key(key_obj.via.str.ptr, key_obj.via.str.size);
-            if (field_key == "metadata") {
+            if (field_key == "metadata" ||
+                field_key == "metadata_with_durable_deletes_v2") {
+                if (metadata_array) {
+                    return tl::make_unexpected(
+                        SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                           "Duplicate metadata field"));
+                }
                 metadata_array = &obj.via.map.ptr[i].val;
+                fenced_format = field_key != "metadata";
+            } else if (field_key == "durable_deletes_v2") {
+                if (deletes_array) {
+                    return tl::make_unexpected(
+                        SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                           "Duplicate delete fence field"));
+                }
+                deletes_array = &obj.via.map.ptr[i].val;
             }
         }
+    }
+
+    if (fenced_format != (deletes_array != nullptr) ||
+        (deletes_array && (deletes_array->type != msgpack::type::ARRAY ||
+                           deletes_array->via.array.size == 0))) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "Missing or invalid delete fence state"));
     }
 
     // Clear existing data
@@ -12107,6 +12687,56 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 return r.is_local_disk_replica() && r.is_completed();
             })) {
             shard.disk_object_count++;
+        }
+    }
+
+    if (deletes_array) {
+        for (uint32_t i = 0; i < deletes_array->via.array.size; ++i) {
+            const auto& item = deletes_array->via.array.ptr[i];
+            if (item.type != msgpack::type::ARRAY || item.via.array.size != 5 ||
+                item.via.array.ptr[0].type != msgpack::type::STR ||
+                item.via.array.ptr[1].type != msgpack::type::STR ||
+                item.via.array.ptr[2].type != msgpack::type::STR ||
+                item.via.array.ptr[3].type != msgpack::type::BOOLEAN ||
+                item.via.array.ptr[4].type != msgpack::type::STR) {
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "Invalid delete fence record"));
+            }
+            const TenantId tenant(item.via.array.ptr[0].as<std::string>());
+            const auto key = item.via.array.ptr[1].as<std::string>();
+            UUID operation_id;
+            if (!tenant.IsValid() || key.empty() ||
+                !StringToUuid(item.via.array.ptr[2].as<std::string>(),
+                              operation_id) ||
+                service_->getShardIndex(tenant, key) !=
+                    static_cast<size_t>(&shard -
+                                        service_->metadata_shards_.data())) {
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "Invalid delete fence identity"));
+            }
+            const auto namespace_identity =
+                item.via.array.ptr[4].as<std::string>();
+            if (namespace_identity.empty() || namespace_identity.size() > 1024)
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL, "Invalid delete namespace"));
+            const bool completed = item.via.array.ptr[3].as<bool>();
+            auto& state = service_->GetOrCreateTenantState(shard, tenant);
+            const auto metadata = state.metadata.find(key);
+            if ((completed && metadata != state.metadata.end()) ||
+                !state.durable_deletions
+                     .emplace(key,
+                              TenantState::DurableDeleteState{
+                                  operation_id, completed, namespace_identity})
+                     .second) {
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "Conflicting delete fence state"));
+            }
+            if (metadata != state.metadata.end()) {
+                metadata->second.durable_delete_pending = true;
+            }
         }
     }
 
@@ -12447,6 +13077,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
 
     const auto& metadata = accessor.Get();
+    if (metadata.durable_delete_pending) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto& segment_names = metadata.GetReplicaSegmentNames();
     if (segment_names.empty()) {
         LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
@@ -12509,6 +13142,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     }
 
     const auto& metadata = accessor.Get();
+    if (metadata.durable_delete_pending) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto& segment_names = metadata.GetReplicaSegmentNames();
     if (std::find(segment_names.begin(), segment_names.end(), source) ==
         segment_names.end()) {
@@ -13184,6 +13820,7 @@ KvEventConfig MasterService::BuildKvEventConfig(
 // medium so subscribers see one logical tier per storage class.
 std::vector<std::string> MasterService::KvMediaForMetadata(
     const ObjectMetadata& metadata) {
+    if (metadata.durable_delete_pending) return {};
     bool has_cpu = false;
     bool has_disk = false;
     metadata.VisitReplicas(

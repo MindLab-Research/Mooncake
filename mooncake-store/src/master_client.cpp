@@ -6,6 +6,7 @@
 
 #include <csignal>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -60,6 +61,11 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
     static constexpr const char* value = "BatchGetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListForAdmin> {
+    static constexpr const char* value = "BatchGetReplicaListForAdmin";
 };
 
 template <>
@@ -213,6 +219,20 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveDurable> {
+    static constexpr const char* value = "RemoveDurable";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::ValidateDurableDeleteAssignment> {
+    static constexpr const char* value = "ValidateDurableDeleteAssignment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterDurableDeleteProvider> {
+    static constexpr const char* value = "RegisterDurableDeleteProvider";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
     static constexpr const char* value = "MountLocalDiskSegment";
 };
@@ -354,8 +374,17 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    if constexpr (std::string_view(
+                                      RpcNameTraits<ServiceMethod>::value) ==
+                                  "RemoveDurable") {
+                        return client.send_request<ServiceMethod>(
+                            coro_rpc::request_config_t{
+                                kDurableCoordinatorDeleteTimeout},
+                            std::forward<Args>(args)...);
+                    } else {
+                        return client.send_request<ServiceMethod>(
+                            std::forward<Args>(args)...);
+                    }
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
@@ -572,6 +601,14 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
         object_keys.size(), object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListForAdmin(
+    const std::vector<std::string>& keys) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
+                            GetReplicaListResponse>(keys.size(), keys,
+                                                    tenant_id_.value());
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -944,6 +981,25 @@ MasterClient::GetStorageConfig() {
                              GetStorageConfigResponse>();
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RemoveDurable(
+    const std::string& key) {
+    return invoke_rpc<&WrappedMasterService::RemoveDurable, void>(
+        key, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::ValidateDurableDeleteAssignment(
+    const DurableDeleteCommand& command) {
+    return invoke_rpc<&WrappedMasterService::ValidateDurableDeleteAssignment,
+                      void>(command);
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterDurableDeleteProvider(
+    const UUID& client_id, const DurableObjectStorageNamespace& scope,
+    const std::string& provider_rpc_endpoint) {
+    return invoke_rpc<&WrappedMasterService::RegisterDurableDeleteProvider,
+                      void>(client_id, scope, provider_rpc_endpoint);
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(

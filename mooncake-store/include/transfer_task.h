@@ -221,7 +221,7 @@ class TransferEngineOperationState : public OperationState {
         : engine_(engine),
           batch_id_(batch_id),
           batch_size_(batch_size),
-          start_ts_(getCurrentTimeInMilli()) {}
+          start_time_(std::chrono::steady_clock::now()) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -246,7 +246,10 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
-    const int64_t start_ts_;
+    const std::chrono::steady_clock::time_point start_time_;
+    std::once_flag abort_once_;
+    std::atomic<bool> deadline_exceeded_{false};
+    void abort_timed_out_batch();
 };
 
 /**

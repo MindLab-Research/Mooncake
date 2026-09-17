@@ -362,6 +362,11 @@ DEFINE_string(tenant_quota_connector_type, "file",
 DEFINE_string(tenant_quota_connector_uri, "",
               "Tenant quota policy connector URI");
 
+DEFINE_string(
+    durable_delete_journal_path, "",
+    "Absolute persistent local deletion journal; standalone Master only. "
+    "Empty disables durable-delete admission");
+
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, "",
               "Optional local directory for snapshot and restore backup. "
@@ -669,6 +674,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              &master_config.tenant_quota_connector_uri,
                              FLAGS_tenant_quota_connector_uri);
 
+    default_config.GetString("durable_delete_journal_path",
+                             &master_config.durable_delete_journal_path,
+                             FLAGS_durable_delete_journal_path);
     default_config.GetString("snapshot_backup_dir",
                              &master_config.snapshot_backup_dir,
                              FLAGS_snapshot_backup_dir);
@@ -1286,6 +1294,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
     }
+    if ((google::GetCommandLineFlagInfo("durable_delete_journal_path", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.durable_delete_journal_path =
+            FLAGS_durable_delete_journal_path;
+    }
     bool use_snapshot_object_store_flag = false;
     bool use_snapshot_payload_store_flag = false;
     bool use_snapshot_payload_backend_flag = false;
@@ -1644,10 +1658,19 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        auto wrapped_master_service =
-            std::make_shared<mooncake::WrappedMasterService>(
-                mooncake::WrappedMasterServiceConfig(master_config, version),
-                metadata_server_ptr, http_metadata_remote_url);
+        std::shared_ptr<mooncake::WrappedMasterService> wrapped_master_service;
+        try {
+            wrapped_master_service =
+                std::make_shared<mooncake::WrappedMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config,
+                                                         version),
+                    metadata_server_ptr, http_metadata_remote_url);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Master startup refused: " << error.what()
+                       << "; preserve the journal and use offline recovery. "
+                          "Never delete confirmed fences to force startup.";
+            return 1;
+        }
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);

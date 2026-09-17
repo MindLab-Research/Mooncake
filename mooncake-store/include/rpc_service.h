@@ -53,18 +53,20 @@ class WrappedMasterService {
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
 
-    tl::expected<
+    async_simple::coro::Lazy<tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode>
-    GetReplicaListByRegex(const std::string& str,
-                          const std::string& tenant_id = "default");
+        ErrorCode>>
+    GetReplicaListByRegex(std::string str, std::string tenant_id = "default");
 
-    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+    async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
+    GetReplicaList(std::string key, std::string tenant_id = "default");
 
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const std::string& tenant_id = "default");
+    async_simple::coro::Lazy<
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
+    BatchGetReplicaList(std::vector<std::string> keys,
+                        std::string tenant_id = "default");
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    CheckDurableReadFence(std::string key, std::string tenant_id);
 
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
@@ -208,6 +210,16 @@ class WrappedMasterService {
 
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> RemoveDurable(
+        std::string key, std::string tenant_id = "default");
+
+    tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
+        const DurableDeleteCommand& command);
+
+    tl::expected<void, ErrorCode> RegisterDurableDeleteProvider(
+        const UUID& client_id, const DurableObjectStorageNamespace& scope,
+        const std::string& provider_rpc_endpoint);
 
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);

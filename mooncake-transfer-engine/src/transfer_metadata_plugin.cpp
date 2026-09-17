@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_metadata_plugin.h"
+#include "http_metadata_config.h"
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
@@ -209,7 +210,8 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 #ifdef USE_HTTP
 struct HTTPStoragePlugin : public MetadataStoragePlugin {
     explicit HTTPStoragePlugin(const std::string &metadata_uri)
-        : metadata_uri_(metadata_uri) {
+        : metadata_uri_(metadata_uri),
+          timeouts_(HttpMetadataTimeouts::FromEnv()) {
         global_init_once();
     }
 
@@ -269,8 +271,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         std::string readBody;
         char errbuf[CURL_ERROR_SIZE] = {0};
 
-        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
-        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeouts_.request_ms);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, timeouts_.connect_ms);
 
         const std::string url = encodeUrl(key);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
@@ -316,8 +318,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         std::string readBody;
         char errbuf[CURL_ERROR_SIZE] = {0};
 
-        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
-        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeouts_.request_ms);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, timeouts_.connect_ms);
 
         const std::string url = encodeUrl(key);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
@@ -360,8 +362,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         std::string readBody;
         char errbuf[CURL_ERROR_SIZE] = {0};
 
-        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
-        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeouts_.request_ms);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, timeouts_.connect_ms);
 
         const std::string url = encodeUrl(key);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
@@ -390,6 +392,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
    private:
     const std::string metadata_uri_;
+    const HttpMetadataTimeouts timeouts_;
 };
 
 #endif  // USE_HTTP

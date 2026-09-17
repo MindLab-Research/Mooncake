@@ -28,17 +28,14 @@ bool ContainsAsciiInsensitive(std::string_view haystack,
 
 class S3SnapshotObjectStore::Impl {
    public:
-    Impl() : initialized_(InitializeOnce()), s3_helper_("", "", "") {}
-
-    ~Impl() { S3Helper::ShutdownAPI(); }
+    Impl() : s3_helper_("", "", "") {}
 
    private:
-    static bool InitializeOnce() {
-        S3Helper::InitAPI();
-        return true;
-    }
-
-    bool initialized_;
+    // Members are destroyed in reverse order, after the S3 client is gone.
+    struct ApiLifetime {
+        ApiLifetime() { S3Helper::InitAPI(); }
+        ~ApiLifetime() { S3Helper::ShutdownAPI(); }
+    } api_lifetime_;
 
    public:
     S3Helper s3_helper_;

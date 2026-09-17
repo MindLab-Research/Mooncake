@@ -4,7 +4,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <future>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <endian.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -14,6 +22,7 @@
 
 #include "types.h"
 #include "pinned_buffer_pool.h"
+#include "transport/transport.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
@@ -66,6 +75,305 @@ class TransferTaskTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+TEST_F(TransferTaskTest,
+       TransferDeadlineRetainsBuffersUntilPhysicalCompletion) {
+    ScopedEnvVar deadline("MC_STORE_TRANSFER_TIMEOUT_MS", "10");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17939"), 0);
+    if (engine.isUsingTent()) {
+        GTEST_SKIP() << "Legacy batch state test";
+    }
+    const auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    batch.task_list.resize(1);
+    auto& task = batch.task_list[0];
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    task.total_bytes = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 1;
+    std::atomic<bool> buffer_written{false};
+    TransferEngineOperationState state(engine, batch_id, 1);
+    std::thread transfer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        buffer_written.store(true);
+        slice.markSuccess();
+    });
+    state.wait_for_completion();
+    const bool safe_to_release_buffer = buffer_written.load();
+    transfer.join();
+    EXPECT_TRUE(safe_to_release_buffer);
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+// Fault injection models unsupported cancellation, a stuck abort, and a
+// stuck/failed status query without requiring RDMA hardware. It deliberately
+// never publishes physical completion. These are process-containment tests,
+// not claims that a hardware transport implements a cancellation barrier.
+class UncancellableTransport : public Transport {
+   public:
+    explicit UncancellableTransport(int mode) : mode_(mode) {}
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::OK();
+    }
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        if (mode_ == 2)
+            for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (mode_ == 3)
+            return Status::InvalidArgument("injected query failure");
+        status.s = TransferStatusEnum::TIMEOUT;
+        return Status::OK();
+    }
+    Status abortBatch(BatchID) override {
+        if (mode_ == 1)
+            for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+        return Status::NotImplemented("injected unsupported abort");
+    }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+    const char* getName() const override { return "uncancellable-test"; }
+    int mode_;
+};
+
+TEST_F(TransferTaskTest, SupervisedDeadlineExitsWithoutUnwindingActiveBuffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int mode : {0, 1, 2, 3}) {
+        EXPECT_EXIT(
+            {
+                alarm(5);  // A broken watchdog must fail instead of hanging CI.
+                ScopedEnvVar fatal("MC_STORE_TRANSFER_FATAL_TIMEOUT", "1");
+                ScopedEnvVar timeout("MC_STORE_TRANSFER_TIMEOUT_MS", "20");
+                ScopedEnvVar grace("MC_STORE_TRANSFER_ABORT_GRACE_MS", "100");
+                TransferEngine engine(false);
+                if (engine.init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0))
+                    std::_Exit(80);
+                if (engine.isUsingTent()) std::_Exit(81);
+                UncancellableTransport transport(mode);
+                const auto id = engine.allocateBatchID(1);
+                auto& batch = Transport::toBatchDesc(id);
+                batch.task_list.resize(1);
+                batch.task_list[0].batch_id = id;
+                batch.task_list[0].slice_count = 1;
+                batch.task_list[0].transport_ = &transport;
+                struct CallerBuffer {
+                    ~CallerBuffer() { std::_Exit(77); }
+                } caller_buffer;
+                auto state = std::make_shared<TransferEngineOperationState>(
+                    engine, id, 1);
+                TransferFuture future(state);
+                future.wait();
+                std::_Exit(78);  // Returning with active I/O is not safe.
+            },
+            ::testing::ExitedWithCode(124), "");
+    }
+}
+
+TEST_F(TransferTaskTest, SupervisedDeadlineDisarmsAfterPhysicalCompletion) {
+    ScopedEnvVar fatal("MC_STORE_TRANSFER_FATAL_TIMEOUT", "1");
+    ScopedEnvVar timeout("MC_STORE_TRANSFER_TIMEOUT_MS", "10");
+    ScopedEnvVar grace("MC_STORE_TRANSFER_ABORT_GRACE_MS", "1000");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+    if (engine.isUsingTent()) GTEST_SKIP() << "Legacy batch state test";
+    const auto id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(id);
+    batch.task_list.resize(1);
+    auto& task = batch.task_list[0];
+    task.batch_id = id;
+    task.slice_count = 1;
+    task.total_bytes = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 1;
+    TransferEngineOperationState state(engine, id, 1);
+    std::thread transfer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        slice.markSuccess();
+    });
+    state.wait_for_completion();
+    transfer.join();
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // A completed batch may be waited again after its original deadline.
+    state.wait_for_completion();
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+// A real TCP peer that accepts connections and never sends a response. It
+// remains alive beyond the Store deadline, so peer teardown cannot pass the
+// test accidentally. Late bytes are sent only after both callers returned.
+class UnresponsiveTcpPeer {
+   public:
+    UnresponsiveTcpPeer() {
+        listener_ = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (listener_ < 0 ||
+            bind(listener_, reinterpret_cast<sockaddr*>(&address),
+                 sizeof(address)) ||
+            listen(listener_, 8))
+            return;
+        socklen_t length = sizeof(address);
+        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&address),
+                        &length))
+            return;
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] {
+            while (!stop_.load()) {
+                pollfd fd{listener_, POLLIN, 0};
+                if (poll(&fd, 1, 20) <= 0) continue;
+                int peer = accept(listener_, nullptr, nullptr);
+                if (peer >= 0) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    peers_.push_back(peer);
+                }
+            }
+        });
+    }
+    ~UnresponsiveTcpPeer() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+        for (int peer : peers_) close(peer);
+        if (listener_ >= 0) close(listener_);
+    }
+    uint16_t port() const { return port_; }
+    bool wait_for_connections(size_t count) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (peers_.size() >= count) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+    void send_late_bytes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int peer : peers_) {
+            const uint64_t status = htole64(0x4D435456ull << 32);
+            std::vector<char> bytes(sizeof(status) + 128 * 1024, 'q');
+            std::memcpy(bytes.data(), &status, sizeof(status));
+            (void)send(peer, bytes.data(), bytes.size(),
+                       MSG_NOSIGNAL | MSG_DONTWAIT);
+        }
+    }
+
+   private:
+    int listener_ = -1;
+    uint16_t port_ = 0;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::vector<int> peers_;
+};
+
+TEST_F(TransferTaskTest, StuckTcpBatchAbortsBeforeBuffersAreReleased) {
+    ScopedEnvVar deadline("MC_STORE_TRANSFER_TIMEOUT_MS", "50");
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "2");
+    for (const char* pooled : {"0", "1"}) {
+        ScopedEnvVar pool("MC_TCP_ENABLE_CONNECTION_POOL", pooled);
+        for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+            SCOPED_TRACE(std::string("pool=") + pooled +
+                         ", op=" + std::to_string(opcode));
+            UnresponsiveTcpPeer peer;
+            ASSERT_NE(peer.port(), 0);
+            constexpr size_t length = 128 * 1024;
+            void* mapping = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            ASSERT_NE(mapping, MAP_FAILED);
+            auto unmap = [](void* address) { munmap(address, length); };
+            std::unique_ptr<void, decltype(unmap)> allocation(mapping, unmap);
+            std::span<char> buffer(static_cast<char*>(mapping), length);
+            std::fill(buffer.begin(), buffer.end(), 'x');
+            TransferEngine engine(false);
+            ASSERT_EQ(
+                engine.init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+            auto* transport = engine.installTransport("tcp", nullptr);
+            ASSERT_NE(transport, nullptr);
+            ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
+                                                 "cpu:0"),
+                      0);
+            const auto segment = engine.openSegment(engine.getLocalIpAndPort());
+            auto description =
+                engine.getMetadata()->getSegmentDescByID(segment);
+            ASSERT_NE(description, nullptr);
+            const auto original_port = description->tcp_data_port;
+            description->tcp_data_port = peer.port();
+            description->tcp_proto_version = 2;
+            description->tcp_data_host = "127.0.0.1";
+            std::vector<TransferRequest> requests(1);
+            requests[0].opcode = opcode;
+            requests[0].source = buffer.data();
+            requests[0].length = buffer.size();
+            requests[0].target_id = segment;
+            requests[0].target_offset =
+                reinterpret_cast<uint64_t>(buffer.data());
+            const auto first = engine.allocateBatchID(1);
+            const auto second = engine.allocateBatchID(1);
+            ASSERT_TRUE(engine.submitTransfer(first, requests).ok());
+            ASSERT_TRUE(engine.submitTransfer(second, requests).ok());
+            ASSERT_TRUE(peer.wait_for_connections(2));
+            {
+                // A nonexistent second status slot injects query failure.
+                // Cancellation must still safely terminate and free the batch.
+                TransferEngineOperationState a(engine, first, 1),
+                    b(engine, second, 2);
+                const auto start = std::chrono::steady_clock::now();
+                auto one = std::async(std::launch::async,
+                                      [&] { a.wait_for_completion(); });
+                auto two = std::async(std::launch::async,
+                                      [&] { b.wait_for_completion(); });
+                one.get();
+                two.get();
+                EXPECT_LT(std::chrono::steady_clock::now() - start,
+                          std::chrono::seconds(3));
+                EXPECT_EQ(a.get_result(), ErrorCode::TRANSFER_FAIL);
+                EXPECT_EQ(b.get_result(), ErrorCode::TRANSFER_FAIL);
+                EXPECT_TRUE(transport->isAvailable());
+                // Quiescence precedes caller buffer reuse; late network data
+                // must not overwrite it, even while the engine remains alive.
+                std::fill(buffer.begin(), buffer.end(), 'z');
+                ASSERT_EQ(mprotect(mapping, length, PROT_NONE), 0);
+                peer.send_late_bytes();
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                ASSERT_EQ(mprotect(mapping, length, PROT_READ | PROT_WRITE), 0);
+                EXPECT_TRUE(std::all_of(buffer.begin(), buffer.end(),
+                                        [](char c) { return c == 'z'; }));
+            }
+            // Recover without rebuilding Client/TransferEngine. Restoring
+            // the real endpoint exercises both the new listener and client.
+            description->tcp_data_port = original_port;
+            for (int iteration = 0; iteration < 3; ++iteration) {
+                ScopedEnvVar recovery_deadline("MC_STORE_TRANSFER_TIMEOUT_MS",
+                                               "2000");
+                const auto recovered = engine.allocateBatchID(1);
+                ASSERT_TRUE(engine.submitTransfer(recovered, requests).ok());
+                TransferEngineOperationState state(engine, recovered, 1);
+                state.wait_for_completion();
+                EXPECT_EQ(state.get_result(), ErrorCode::OK);
+            }
+            ASSERT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+        }
+    }
+}
 
 // Test MemcpyOperationState functionality
 TEST_F(TransferTaskTest, MemcpyOperationState) {

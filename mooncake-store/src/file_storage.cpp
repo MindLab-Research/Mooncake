@@ -89,7 +89,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
-        if (client_) {
+        if (client_ && !distributed_backend->UsesObjectStorage()) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
@@ -118,9 +118,26 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
 FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
-    heartbeat_running_ = false;
+    {
+        std::lock_guard lock(metadata_refresh_mutex_);
+        heartbeat_running_ = false;
+    }
+    metadata_refresh_cv_.notify_all();
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
+    }
+    if (metadata_refresh_thread_.joinable()) {
+        metadata_refresh_thread_.join();
+    }
+    // Rescans access other members; finish them before member destruction.
+    if (rescan_future_.valid()) rescan_future_.wait();
+    // Stop all registration work before retiring this Store's advertised route.
+    if (disk_segment_mounted_ && !draining_.load()) {
+        auto result = client_->UnmountLocalDiskSegment();
+        if (!result) {
+            LOG(WARNING) << "Failed to unregister offload Store on shutdown: "
+                         << result.error();
+        }
     }
     client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
@@ -170,6 +187,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                        << mount_file_storage_result.error();
             return mount_file_storage_result;
         }
+        disk_segment_mounted_ = true;
+        auto advertised = AdvertiseDurableDeleteNamespace();
+        if (!advertised) return advertised;
     }
     // Report configured SSD capacity to Master so it can populate
     // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
@@ -183,6 +203,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
+    storage_backend_->ResetScanIterator();
     auto scan_meta_result = storage_backend_->ScanMeta(
         [this](const std::vector<std::string>& keys,
                std::vector<StorageObjectMetadata>& metadatas) {
@@ -213,6 +234,26 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
 
     heartbeat_running_.store(true);
+    if (config_.storage_backend_type == StorageBackendType::kS3ObjectStorage &&
+        config_.s3_metadata_refresh_interval_seconds != 0) {
+        metadata_refresh_thread_ = std::thread([this]() {
+            std::unique_lock lock(metadata_refresh_mutex_);
+            while (!metadata_refresh_cv_.wait_for(
+                lock,
+                std::chrono::seconds(
+                    config_.s3_metadata_refresh_interval_seconds),
+                [this] { return !heartbeat_running_.load(); })) {
+                lock.unlock();
+                if (!draining_.load()) {
+                    auto result = ReRegisterOffloadedObjects();
+                    if (!result)
+                        LOG(WARNING)
+                            << "S3 metadata refresh failed: " << result.error();
+                }
+                lock.lock();
+            }
+        });
+    }
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
                   << config_.heartbeat_interval_seconds
@@ -308,6 +349,9 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
+    std::unique_lock lifecycle_lock(durable_object_mutex_, std::defer_lock);
+    if (config_.storage_backend_type == StorageBackendType::kS3ObjectStorage)
+        lifecycle_lock.lock();
     if (offloading_objects.empty()) {
         return {};
     }
@@ -470,11 +514,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
 
         auto offload_start = std::chrono::steady_clock::now();
+        std::unordered_set<std::string> completed_keys;
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler](
+            [this, offload_start, complete_handler, &completed_keys](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
+            if (res == ErrorCode::OK)
+                completed_keys.insert(keys.begin(), keys.end());
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -501,6 +548,24 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 return NotifyEvictedDiskReplicas(evicted_keys);
             });
 
+        if (config_.storage_backend_type ==
+            StorageBackendType::kS3ObjectStorage) {
+            // The object backend can return partial success. Keep the original
+            // source task pinned while retrying only unpublished objects.
+            auto pending = host_batch_object;
+            for (const auto& key : completed_keys) pending.erase(key);
+            for (int retry = 0; retry < 2 && !pending.empty(); ++retry) {
+                std::this_thread::sleep_for(std::chrono::seconds(1 << retry));
+                offload_res = storage_backend_->BatchOffload(
+                    pending, bucket_complete_handler, nullptr);
+                for (const auto& key : completed_keys) pending.erase(key);
+            }
+            if (offload_res.has_value()) {
+                for (const auto& [key, _] : pending)
+                    failed_tasks.push_back(task_by_storage_key.at(key));
+            }
+        }
+
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
             pinned_buffer_pool_->Release(std::move(buf));
@@ -514,6 +579,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             // offloading tasks and source-replica refcounts from leaking until
             // the put_start_release_timeout_sec_ TTL reaper fires.
             for (const auto& [key, _] : host_batch_object) {
+                if (completed_keys.contains(key)) continue;
                 failed_tasks.push_back(task_by_storage_key.at(key));
             }
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
@@ -668,9 +734,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         rescan_future_ = std::future<void>();
     }
 
-    // Retry metadata resync if previous attempt failed.
     if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
-        LOG(INFO) << "Retrying background metadata rescan";
+        LOG(INFO) << "Starting background metadata rescan";
         rescan_future_ = std::async(std::launch::async, [this]() {
             auto result = ReRegisterOffloadedObjects();
             if (!result) {
@@ -697,6 +762,11 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
             return {};
         }
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
+            // Replay capability even if Master recovered LOCAL_DISK membership
+            // from a snapshot: the provider registry itself is intentionally
+            // volatile. The next retry after remount will register as well.
+            auto advertised = AdvertiseDurableDeleteNamespace();
+            if (!advertised) return advertised;
             return client_->OffloadObjectHeartbeat(enable_offloading_,
                                                    offloading_objects);
         };
@@ -1201,6 +1271,11 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
+    std::unique_lock lifecycle_lock(durable_object_mutex_, std::defer_lock);
+    if (config_.storage_backend_type == StorageBackendType::kS3ObjectStorage)
+        lifecycle_lock.lock();
+    // Startup recovery and periodic discovery share the backend scan cursor.
+    std::lock_guard scan_lock(metadata_scan_mutex_);
     LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
               << "offloaded objects with master";
     int total_keys = 0;
@@ -1270,6 +1345,93 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
               << " total_batches=" << total_batches
               << " total_failures=" << total_failures;
     return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::CheckDurableRead(
+    const DurableReadCommand& command) {
+    const TenantId tenant(command.tenant_id);
+    if (!client_ || command.provider_id != client_->getClientId() ||
+        command.provider_endpoint != local_rpc_addr_ || !tenant.IsValid() ||
+        command.key.empty())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
+    if (!backend) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    return backend->CheckDurableRead(tenant.MakeScopedKey(command.key),
+                                     command.storage_namespace);
+}
+
+tl::expected<void, ErrorCode> FileStorage::FenceOffloadedObject(
+    const DurableDeleteCommand& command) {
+    const TenantId tenant(command.tenant_id);
+    if (!client_ || command.provider_id != client_->getClientId() ||
+        command.provider_endpoint != local_rpc_addr_ || !tenant.IsValid() ||
+        command.key.empty())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
+    if (!backend) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    std::lock_guard lifecycle_lock(durable_object_mutex_);
+    auto authorized = client_->ValidateDurableDeleteAssignment(command);
+    if (!authorized) return authorized;
+    return backend->FenceObject(tenant.MakeScopedKey(command.key),
+                                command.storage_namespace);
+}
+
+tl::expected<void, ErrorCode> FileStorage::DeleteOffloadedObject(
+    const DurableDeleteCommand& command) {
+    const TenantId tenant(command.tenant_id);
+    if (!client_ || command.provider_id != client_->getClientId() ||
+        command.provider_endpoint != local_rpc_addr_ || !tenant.IsValid() ||
+        command.key.empty())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
+    if (!backend || !backend->UsesObjectStorage())
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    std::lock_guard lifecycle_lock(durable_object_mutex_);
+    // Validate only after this process's old uploads/refresh callbacks drained.
+    // A guessed, stale or reassigned command must never create an OSS marker.
+    auto authorized = client_->ValidateDurableDeleteAssignment(command);
+    if (!authorized) return authorized;
+    return backend->DeleteObject(tenant.MakeScopedKey(command.key),
+                                 command.storage_namespace);
+}
+
+tl::expected<void, ErrorCode> FileStorage::AdvertiseDurableDeleteNamespace() {
+    if (!client_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto scope = GetDurableDeleteNamespace();
+    if (!scope) {
+        if (scope.error() != ErrorCode::NOT_SUPPORTED) {
+            LOG_EVERY_N(WARNING, 60)
+                << "Object storage deletion capability invalid: "
+                << scope.error();
+        }
+        return scope.error() == ErrorCode::NOT_SUPPORTED
+                   ? tl::expected<void, ErrorCode>{}
+                   : tl::make_unexpected(scope.error());
+    }
+    const auto registered =
+        client_->RegisterDurableDeleteProvider(*scope, local_rpc_addr_);
+    if (!registered) {
+        // Protocol v3 requires a journal-backed Master before mounting.
+        // Legacy protocols remain optional, but silently downgrading v3
+        // would bypass the advertised durable read/delete fencing contract.
+        LOG_EVERY_N(WARNING, 60)
+            << "Object storage deletion capability not registered: "
+            << registered.error();
+        if (scope->protocol_version == kDurableReadFenceProtocolVersion)
+            return registered;
+    }
+    return {};
+}
+
+tl::expected<DurableObjectStorageNamespace, ErrorCode>
+FileStorage::GetDurableDeleteNamespace() const {
+    const auto backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
+    if (!backend) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    return backend->GetDurableDeleteNamespace();
 }
 
 }  // namespace mooncake

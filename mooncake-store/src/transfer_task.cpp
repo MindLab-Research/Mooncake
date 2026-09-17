@@ -39,6 +39,51 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
+// Opt-in process containment for supervised Store clients. The timer is
+// independent of the polling/abort thread: either operation may itself hang.
+// Never unwind caller buffers when native I/O has no quiescence barrier.
+class TransferProcessDeadline {
+   public:
+    explicit TransferProcessDeadline(
+        std::chrono::steady_clock::time_point deadline) {
+        const char* mode = std::getenv("MC_STORE_TRANSFER_FATAL_TIMEOUT");
+        if (!mode || std::strcmp(mode, "1") != 0) return;
+        try {
+            worker_ = std::thread([this, deadline] {
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (cv_.wait_until(lock, deadline,
+                                   [this] { return completed_; }))
+                    return;
+                // Avoid logging locks, atexit handlers and destructors, any of
+                // which can deadlock or release memory still used by native
+                // I/O. Exit 124 identifies a supervised native-transfer
+                // timeout.
+                std::_Exit(124);
+            });
+        } catch (...) {
+            // A supervised process must not silently lose its safety timer.
+            std::_Exit(124);
+        }
+    }
+    ~TransferProcessDeadline() {
+        if (!worker_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            completed_ = true;
+        }
+        cv_.notify_one();
+        worker_.join();
+    }
+    TransferProcessDeadline(const TransferProcessDeadline&) = delete;
+    TransferProcessDeadline& operator=(const TransferProcessDeadline&) = delete;
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool completed_ = false;
+    std::thread worker_;
+};
+
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
@@ -759,8 +804,9 @@ void TransferEngineOperationState::check_task_status() {
             LOG(ERROR) << "Failed to get transfer status for batch "
                        << batch_id_ << " task " << i << " with error "
                        << s.message();
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+            // Failure to observe status is not proof that writes stopped.
+            all_terminated = false;
+            continue;
         }
 
         switch (status.s) {
@@ -821,93 +867,70 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     result_.emplace(error_code);
 }
 
+void TransferEngineOperationState::abort_timed_out_batch() {
+    std::call_once(abort_once_, [this] {
+        deadline_exceeded_.store(true, std::memory_order_release);
+        // Tent and non-cancellable transports retain the synchronous lifetime
+        // contract. Never reinterpret a Tent batch as a legacy BatchDesc.
+        if (engine_.isUsingTent()) return;
+        auto& batch = Transport::toBatchDesc(batch_id_);
+        std::vector<Transport*> transports;
+        for (const auto& task : batch.task_list) {
+            if (task.transport_ &&
+                std::find(transports.begin(), transports.end(),
+                          task.transport_) == transports.end())
+                transports.push_back(task.transport_);
+        }
+        bool quiesced =
+            !transports.empty() &&
+            std::all_of(
+                batch.task_list.begin(), batch.task_list.end(),
+                [](const auto& task) { return task.transport_ != nullptr; });
+        for (auto* transport : transports) {
+            auto status = transport->abortBatch(batch_id_);
+            if (!status.ok()) {
+                quiesced = false;
+                LOG(ERROR) << "Cannot abort batch " << batch_id_ << ": "
+                           << status.message() << "; retaining caller buffers";
+            }
+        }
+        if (quiesced) {
+            // Successful abort is the physical completion barrier. A broken
+            // status query after that must not strand an already drained RPC.
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Status polling normally sets this bookkeeping flag. The abort
+            // barrier also permits freeing a batch when polling itself fails.
+            for (auto& task : batch.task_list) task.is_finished = true;
+            if (!result_) set_result_internal(ErrorCode::TRANSFER_FAIL);
+        }
+    });
+}
+
 void TransferEngineOperationState::wait_for_completion() {
-    if (is_completed()) {
-        return;
-    }
-
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
-
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
-
-    // Wait directly on BatchDesc's condition variable.
-    auto& batch_desc = Transport::toBatchDesc(batch_id_);
-    bool completed;
-    bool failed = false;
-
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
-    completed = batch_desc.is_finished.load(std::memory_order_acquire);
-    if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-        const int64_t elapsed_milliseconds =
-            getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
-            completed = batch_desc.completion_cv.wait_for(
-                lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
-                [&batch_desc] {
-                    return batch_desc.is_finished.load(
-                        std::memory_order_relaxed);
-                });
-        }
-    }  // Explicitly release completion_mutex before acquiring mutex_
-
-    // Once completion is observed, read failure flag.
-    if (completed) {
-        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
-    }
-
-    ErrorCode error_code =
-        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                  : ErrorCode::TRANSFER_FAIL;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
-    }
-
-    if (completed) {
-        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
-    } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
-    }
-#else
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
-
+    const auto deadline =
+        start_time_ + std::chrono::milliseconds(GetPositiveEnvOrDefault(
+                          "MC_STORE_TRANSFER_TIMEOUT_MS", 60 * 1000));
+    TransferProcessDeadline process_deadline(
+        std::max(deadline, std::chrono::steady_clock::now()) +
+        std::chrono::milliseconds(
+            GetPositiveEnvOrDefault("MC_STORE_TRANSFER_ABORT_GRACE_MS", 5000)));
     while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!result_) check_task_status();
+            if (result_) {
+                if (deadline_exceeded_.load(std::memory_order_acquire))
+                    result_ = ErrorCode::TRANSFER_FAIL;
+                return;
+            }
         }
-
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
-        }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+        if (std::chrono::steady_clock::now() >= deadline)
+            abort_timed_out_batch();
+        // Poll physical completion even in event builds: a lost notification
+        // must not strand a completed transfer. A cancellation request alone
+        // is never sufficient to release caller-owned memory.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-#endif
 }
 
 // ============================================================================
@@ -925,9 +948,8 @@ TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
 bool TransferFuture::isReady() const { return state_->is_completed(); }
 
 ErrorCode TransferFuture::wait() {
-    if (!isReady()) {
-        state_->wait_for_completion();
-    }
+    // Arm the supervised deadline before the first native status query.
+    state_->wait_for_completion();
     return state_->get_result();
 }
 
