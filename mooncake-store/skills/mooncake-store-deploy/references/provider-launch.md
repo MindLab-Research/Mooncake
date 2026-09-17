@@ -138,14 +138,25 @@ workers = 2
 
 ## Mint API 接入与读取探针
 
-在已有 Mint API 配置中设置本地域 sidecar 地址（其余数据库、认证、调度配置保留）：
+在已有 Mint API 配置中同时设置新写入后端和本地域 sidecar 地址（其余数据库、认证、调度配置保留）：
 
 ```toml
 [sidecar]
 url = "http://127.0.0.1:17420"
+[store]
+kind = "mooncake"
+# 保留已有 bucket/object_prefix/region，供历史 S3 描述符使用。
+[store.mooncake]
+master_server_addr = "<MASTER_IP>:50481"
+metadata_server = "http://<MASTER_IP>:28482/metadata"
+local_hostname = "<NODE_ROUTABLE_IP>:<UNIQUE_CLIENT_PORT>"
+protocol = "tcp"
+global_segment_size = 0
+enable_ssd_offload = false
+require_offload = true
 ```
 
-这是 Mint API 的配置，不是 sidecar TOML。保持 loopback，并将 API 与 sidecar 放在同一网络命名空间；不要替换成跨 Pod Service。API 的模型 catalog 不会因为共享 Master 自动同步；通过当前候选提供的 artifact catalog export/import API 交接描述信息，再由目标 sidecar 读取对象。模型导入要求 base_model/LoRA metadata 匹配，不使用无模型 metadata 的普通 tar 冒充模型 checkpoint。API `[server] public_base_url` 必须设置为客户端下载可达的 HTTPS 基础地址，并正确转发下载路由。下载 token 使用 API `[auth] download_signing_secret`，必须非空且与业务 `admin_token`、管理 `admin_management_token` 都不同。通过受保护的 API TOML/Secret 配置；同一 API 的副本保持一致，轮换会使旧下载 token 失效。不要用 OSS 凭据代替。
+这是 Mint API 的配置，不是 sidecar TOML。API 的 `[store] kind` 决定数据库中新对象的 URI，sidecar 的同名字段决定实际持久化后端，两者必须一致；API 配置解析要求 `[store.mooncake]`，但 API 不创建原生连接。不要将这两个表复制到 composer：composer 的 `[store]` 只接受 bucket/object_prefix/region，使用 scheduler 下发的对象描述符，通过同 Pod sidecar 执行存储。`env2toml.sh` 仅为一次性旧环境迁移工具，已有 `MINT_STORE_ENGINE_KIND` 同时生成 API/sidecar 的 kind；Mooncake 连接表仍需按本节补齐，不是运行时环境变量配置入口。保持 loopback，并将 API 与 sidecar 放在同一网络命名空间；不要替换成跨 Pod Service。API 的模型 catalog 不会因为共享 Master 自动同步；通过当前候选提供的 artifact catalog export/import API 交接描述信息，再由目标 sidecar 读取对象。模型导入要求 base_model/LoRA metadata 匹配，不使用无模型 metadata 的普通 tar 冒充模型 checkpoint。API `[server] public_base_url` 必须设置为客户端下载可达的 HTTPS 基础地址，并正确转发下载路由。下载 token 使用 API `[auth] download_signing_secret`，必须非空且与业务 `admin_token`、管理 `admin_management_token` 都不同。通过受保护的 API TOML/Secret 配置；同一 API 的副本保持一致，轮换会使旧下载 token 失效。不要用 OSS 凭据代替。
 
 读取探针使用独立的部署参数 TOML（不要把下面字段塞入 sidecar TOML）：
 
@@ -186,8 +197,16 @@ credentials_file = "/run/secrets/mint-legacy-s3.ini"
 
 凭据文件权限 0600，格式为 `[default]` 下的 `aws_access_key_id` 和 `aws_secret_access_key`。这是旧 S3 的凭据，与 Mooncake provider 的 OSS 环境文件分别挂载；不注入 Mint API。当前候选只支持这里的静态 key 文件格式，不假定支持 session token 或自动 IAM role。未配置 endpoint 时 Mooncake 模式不会启用旧 S3 fallback；历史 `s3://` 的保留不能仅靠 `kind = "mooncake"` 达成。
 
-切回 S3 写入时将同一 `[store] kind` 改为 `s3`，保留上述 endpoint/bucket/credentials 配置并重启 sidecar。回滚前先验证历史 S3 的读写/presign；已写入的 `mint://` 对象仍依赖 Mooncake 路径，不能假定切回 S3 会迁移这些对象或继续支持所有 Mint URI 读取。
+切回 S3 写入时同时将 API 与 sidecar 的 `[store] kind` 改为 `s3`，保留上述 endpoint/bucket/credentials 配置并重启 API 和 sidecar。回滚前先验证历史 S3 的读写/presign；已写入的 `mint://` 对象仍依赖 Mooncake 路径，不能假定切回 S3 会迁移这些对象或继续支持所有 Mint URI 读取。
 
 `delete_retry_timeout_secs` 从 Mint `3fe2ac61` 引入；上方配置示例面向包含该提交的审核后版本，不可原样用于旧 `90913210` 二进制（未知字段会被拒绝）。
 
-删除重试预算由 `delete_retry_timeout_secs` 单独控制（默认 960 秒），须覆盖 Master 的读租约；它不改变或缩短 Master 的 900 秒保护。调用方默认 DeleteArtifact RPC 期限为 1020 秒；若部署使用更长租约，同步增大两项预算。原生调用本身仍需传输层期限与安全终止，不能用 async 取消代替。
+删除重试预算由 `delete_retry_timeout_secs` 单独控制（默认 960 秒），须覆盖 Master 的读租约；它不改变或缩短 Master 的 900 秒保护。调用方默认 DeleteArtifact RPC 期限为 1020 秒；本部署采用上述固定预算；不能仅增大 sidecar 预算。自定义更长租约需要调用方通过 `RpcTimeouts` 同步设置更长期限并另行验收，当前生产调用方使用默认期限。原生调用本身仍需传输层期限与安全终止，不能用 async 取消代替。
+
+## 配套 Mint 版本边界
+
+以下 catalog 约束要求配套 Mint 包含 `86332ab4` 修复；Mooncake 原生二进制不因本文档修订改变。
+
+LoRA rank 缺省或为0时，catalog export 从已读取的权重对象根目录 `adapter_config.json` 解析实际正整数 `r`，不把默认 rank 猜成某个值。该检查流式扫描，解压后最多16 GiB、配置文件最多64 KiB，并受 catalog 超时限制；缺失/重复配置、扩展 tar header 或超出限制拒绝导出，需提供符合规范的 checkpoint。
+
+catalog 的 admission acquire/release RPC 各有5秒期限；请求超时且结果不确定时保留原租约，不能强行删租约重试。catalog staging 保留25小时，覆盖最长24小时传输及租约余量；同一 staging 重试在行锁内续期。普通 upload 仍为1小时。
