@@ -1040,6 +1040,12 @@ class RealClient : public PyClient {
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
+    // Serializes setup_internal() and tearDownAll_internal(). A SIGTERM can
+    // start teardown on the signal thread while setup is still building
+    // FileStorage and the offload RPC server; without this, teardown would
+    // release those members while setup is still assigning and using them.
+    std::mutex lifecycle_mutex_;
+
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
 

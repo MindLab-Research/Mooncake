@@ -259,6 +259,8 @@ set_tests_properties(dummy_client_object_checksum_test
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
+add_store_test(real_client_offload_lifecycle_test
+               real_client_offload_lifecycle_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
 add_store_test(object_data_type_test object_data_type_test.cpp)

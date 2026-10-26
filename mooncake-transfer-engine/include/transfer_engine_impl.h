@@ -467,6 +467,9 @@ class TransferEngineImpl {
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
+    // True once addRpcMetaEntry succeeded for local_server_name_; freeEngine
+    // removes the rpc_meta entry only in that case.
+    bool rpc_meta_registered_ = false;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;

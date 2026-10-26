@@ -202,6 +202,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
+    // Only an entry this engine registered may be removed on teardown: a
+    // rejected duplicate (another live engine owns the name) must not delete
+    // the owner's route while this failed instance unwinds.
+    rpc_meta_registered_ = true;
 
     // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
     // transport installation logic and use TCP transport only. This allows
@@ -462,7 +466,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 int TransferEngineImpl::freeEngine() {
     if (metadata_) {
-        metadata_->removeRpcMetaEntry(local_server_name_);
+        if (rpc_meta_registered_) {
+            metadata_->removeRpcMetaEntry(local_server_name_);
+            rpc_meta_registered_ = false;
+        }
         metadata_.reset();
     }
     return 0;

@@ -764,6 +764,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    // Held for the whole setup; tearDownAll_internal() waits for it.
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -1394,6 +1396,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                                          std::memory_order_acq_rel)) {
         return {};
     }
+    // A signal can arrive while setup_internal() is still running; let it
+    // finish (or fail) before releasing what it is building.
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
     if (durable_delete_rpc_handler_)
         durable_delete_rpc_handler_->StopAndDrain();
@@ -1417,6 +1422,19 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         local_buffer_region_.reset();
     }
+
+    // The offload RPC server's handlers and the durable-delete executors hold
+    // FileStorage, and FileStorage holds its own shared_ptr<Client>. Stop the
+    // server and drop FileStorage first, so client_.reset() below releases
+    // the last Client reference: ~Client destroys the TransferEngine, whose
+    // freeEngine() removes this provider's rpc_meta entry. Otherwise a clean
+    // stop leaves the entry behind and an immediate restart under the same
+    // --host is rejected as a duplicate (mint#1776).
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
+    file_storage_.reset();
 
     // Reset all resources
     client_.reset();
