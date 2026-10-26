@@ -19,6 +19,14 @@ provider discovery to converge before retrying. The default empty setting
 retains the existing selection behavior. The setting is read once per process;
 restart the sidecar with the updated endpoint after a provider port change.
 
+The offload RPC server binds an OS-assigned port by default, so the endpoint
+changes on every provider restart. Set `MC_STORE_OFFLOAD_RPC_PORT` in the
+provider environment to a fixed port to keep the endpoint stable across
+restarts; then the sidecar's `MC_STORE_REQUIRED_OFFLOAD_ENDPOINT` can be
+written once. Unset or `0` keeps the OS-assigned port. A value that is not an
+integer in `[0, 65535]`, or a port that cannot be bound, fails provider setup
+rather than falling back to a random port.
+
 This is a data routing option, not an authorization boundary. It does not
 change the C ABI, give the sidecar OSS credentials, bypass Master discovery,
 extend read leases, or disable durable-delete fencing. Specialized APIs that

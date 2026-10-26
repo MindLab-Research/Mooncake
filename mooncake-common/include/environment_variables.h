@@ -44,6 +44,8 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_SETUP_RETRIES);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MIN_PORT);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
+    // Fixed listen port for the offload RPC server (0 = OS-assigned).
+    MC_DEFINE_ENV_VAR(int, MC_STORE_OFFLOAD_RPC_PORT);
 };
 
 struct RegisteredPinnedMemoryEnvironmentVariables {

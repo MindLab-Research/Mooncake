@@ -25,6 +25,8 @@
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
+#include "environ.h"
+#include "environment_variables.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -440,6 +442,23 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
         }
     }
     return false;
+}
+
+// Offload RPC listen port from MC_STORE_OFFLOAD_RPC_PORT. 0 (or unset) keeps
+// the OS-assigned port; -1 means an invalid value the caller must reject so a
+// typo never silently re-randomizes a pinned provider endpoint.
+int ReadOffloadRpcPort() {
+    const char *raw = std::getenv(
+        ClientAutoPortEnvironmentVariables::MC_STORE_OFFLOAD_RPC_PORT.name);
+    if (raw == nullptr || *raw == '\0') return 0;
+    const auto port = Environ::Read(
+        ClientAutoPortEnvironmentVariables::MC_STORE_OFFLOAD_RPC_PORT);
+    if (!port.has_value() || *port < 0 || *port > 65535) {
+        LOG(ERROR) << "Invalid MC_STORE_OFFLOAD_RPC_PORT='" << raw
+                   << "': expected an integer in [0, 65535]";
+        return -1;
+    }
+    return *port;
 }
 
 }  // namespace
@@ -1103,8 +1122,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        // MC_STORE_OFFLOAD_RPC_PORT pins the advertised offload endpoint so a
+        // restarted provider keeps the same transport_endpoint and readers
+        // pinned via MC_STORE_REQUIRED_OFFLOAD_ENDPOINT need no rebinding.
+        // Unset or 0 keeps the OS-assigned port; a bind failure on a pinned
+        // port fails setup below instead of silently moving the endpoint.
+        const int offload_port = ReadOffloadRpcPort();
+        if (offload_port < 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        offload_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            1, static_cast<unsigned short>(offload_port), "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
