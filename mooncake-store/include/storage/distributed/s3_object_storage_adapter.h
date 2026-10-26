@@ -17,6 +17,11 @@ struct S3ObjectStorageConfig {
 
     bool Validate() const;
     static S3ObjectStorageConfig FromEnvironment();
+    // Drops trailing '/' so "p", "p/" and "p///" name the same namespace.
+    // Every physical key is built as key_prefix + "/<area>/..."; a trailing
+    // slash would make LIST query "p//objects/" while PUT/GET land on the
+    // endpoint-normalized "p/objects/", hiding every object from ScanMeta.
+    static std::string NormalizeKeyPrefix(std::string prefix);
 };
 
 #ifdef HAVE_AWS_SDK
