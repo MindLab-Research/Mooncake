@@ -18,7 +18,13 @@ S3ObjectStorageConfig S3ObjectStorageConfig::FromEnvironment() {
     read("MOONCAKE_AWS_BUCKET_NAME", config.bucket);
     read("MOONCAKE_AWS_REGION", config.region);
     read("MOONCAKE_S3_KEY_PREFIX", config.key_prefix);
+    config.key_prefix = NormalizeKeyPrefix(std::move(config.key_prefix));
     return config;
+}
+
+std::string S3ObjectStorageConfig::NormalizeKeyPrefix(std::string prefix) {
+    while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+    return prefix;
 }
 
 bool S3ObjectStorageConfig::Validate() const {
@@ -33,7 +39,9 @@ bool S3ObjectStorageConfig::Validate() const {
     const auto authority = endpoint.substr(scheme_end + 3);
     if (authority.empty() || authority.find('/') != std::string::npos)
         return false;
-    return !bucket.empty() && !region.empty() && !key_prefix.empty() &&
+    // A prefix of only slashes normalizes to empty: no owned namespace.
+    return !bucket.empty() && !region.empty() &&
+           !NormalizeKeyPrefix(key_prefix).empty() &&
            key_prefix.size() <= 909 &&
            key_prefix.find('\0') == std::string::npos &&
            bucket.find('\0') == std::string::npos &&
@@ -70,8 +78,19 @@ int Unhex(char c) {
 }
 }  // namespace
 
+namespace {
+// Configs built in code skip FromEnvironment; normalize on construction too so
+// PhysicalPrefix/WriterPrefix/DeletionIntentKey and the published durable
+// namespace always share one canonical prefix.
+S3ObjectStorageConfig Normalized(S3ObjectStorageConfig config) {
+    config.key_prefix =
+        S3ObjectStorageConfig::NormalizeKeyPrefix(std::move(config.key_prefix));
+    return config;
+}
+}  // namespace
+
 S3ObjectStorageAdapter::S3ObjectStorageAdapter(S3ObjectStorageConfig config)
-    : config_(std::move(config)) {}
+    : config_(Normalized(std::move(config))) {}
 
 S3ObjectStorageAdapter::~S3ObjectStorageAdapter() {
     helper_.reset();
