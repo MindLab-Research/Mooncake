@@ -99,6 +99,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
                         config.heartbeat_interval_seconds);
+    config.offload_poll_interval_ms =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_POLL_INTERVAL_MS,
+                        config.offload_poll_interval_ms);
     config.s3_metadata_refresh_interval_seconds = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_S3_METADATA_REFRESH_INTERVAL_SECONDS,
         config.s3_metadata_refresh_interval_seconds);
@@ -236,6 +239,12 @@ bool FileStorageConfig::Validate() const {
     }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
+        return false;
+    }
+    if (offload_poll_interval_ms >
+        static_cast<uint64_t>(heartbeat_interval_seconds) * 1000) {
+        LOG(ERROR) << "FileStorageConfig: offload_poll_interval_ms must not "
+                      "exceed heartbeat_interval_seconds * 1000";
         return false;
     }
     if (disk_eviction_low_watermark_ratio <= 0.0 ||
