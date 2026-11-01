@@ -255,10 +255,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         });
     }
     heartbeat_thread_ = std::thread([this]() {
-        const auto heartbeat_interval =
-            std::chrono::milliseconds(static_cast<int64_t>(
-                                          config_.heartbeat_interval_seconds) *
-                                      1000);
+        const auto heartbeat_interval = std::chrono::milliseconds(
+            static_cast<int64_t>(config_.heartbeat_interval_seconds) * 1000);
         // 0 keeps the legacy single cadence. A non-zero value adds offload-only
         // ticks between heartbeats so a new object is picked up within one
         // poll interval instead of one heartbeat interval.
