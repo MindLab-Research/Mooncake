@@ -42,9 +42,12 @@ MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=<NODE_LOCAL_STATE_DIR>
 MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=536870912
 MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=68719476736
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1
+MOONCAKE_OFFLOAD_POLL_INTERVAL_MS=100
 MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS=120000
 MOONCAKE_OFFLOAD_S3_METADATA_REFRESH_INTERVAL_SECONDS=3
 ```
+
+`MOONCAKE_OFFLOAD_POLL_INTERVAL_MS` 决定 provider 多久向 Master 领一次新的 offload 任务。新写入的对象要等到下一次领取才会上传，所以每个对象在确认落盘前都要多等最多一个间隔。不设或设为 0 时沿用旧行为：每个 `HEARTBEAT_INTERVAL_SECONDS` 领一次，部署值 1 s 时，背靠背写入每个对象要多等约 1 s。设成 100 时，这段等待降到约 0.1 s。PollRemoveAll、promotion、水位驱逐仍然按 `HEARTBEAT_INTERVAL_SECONDS` 的节奏运行。这个值不能大于 `HEARTBEAT_INTERVAL_SECONDS × 1000`，否则配置校验失败。
 
 两地域共享相同 endpoint/bucket/prefix；本地状态目录不同。accelerate 需要 bucket 已支持该访问方式。本次仅验收 Alibaba OSS，不能推定任意 S3 兼容后端可用。示例缓冲池适合单次 96 MiB 验证；生产需按同时恢复对象的总大小和持续时间配置。
 

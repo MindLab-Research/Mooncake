@@ -299,6 +299,14 @@ struct FileStorageConfig {
 
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
+    // How often the heartbeat thread asks the master for new offload tasks,
+    // in milliseconds. 0 (default) keeps the legacy behavior: one poll per
+    // heartbeat_interval_seconds. A put is only uploaded on the tick after
+    // its PutEnd, so this bounds the fixed latency every newly written
+    // object pays before it is durable. The rest of the heartbeat work
+    // (PollRemoveAll, promotion, disk watermark eviction, metadata rescan)
+    // keeps running once per heartbeat_interval_seconds.
+    uint32_t offload_poll_interval_ms = 0;
     // Opt-in discovery of immutable objects written by independent S3 stores.
     uint32_t s3_metadata_refresh_interval_seconds = 0;
 
