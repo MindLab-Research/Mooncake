@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -730,5 +731,35 @@ TEST(S3ObjectStorageConfigTest, RequiresExplicitCredentialFreeOrigin) {
         config.endpoint = endpoint;
         EXPECT_TRUE(config.Validate()) << endpoint;
     }
+}
+
+// mint#1775: a trailing '/' on MOONCAKE_S3_KEY_PREFIX made ListKeys/ScanMeta
+// query "p//objects/" while PUT/GET used the endpoint-normalized
+// "p/objects/", so no provider ever re-registered an offloaded object.
+TEST(S3ObjectStorageConfigTest, KeyPrefixTrailingSlashesNameOneNamespace) {
+    for (const std::string prefix : {"p", "p/", "p///"}) {
+        EXPECT_EQ(S3ObjectStorageConfig::NormalizeKeyPrefix(prefix), "p")
+            << prefix;
+    }
+    EXPECT_EQ(S3ObjectStorageConfig::NormalizeKeyPrefix("a/b/"), "a/b");
+    EXPECT_EQ(S3ObjectStorageConfig::NormalizeKeyPrefix("/"), "");
+
+    ASSERT_EQ(setenv("MOONCAKE_S3_KEY_PREFIX", "mint-run-20261024//", 1), 0);
+    const auto config = S3ObjectStorageConfig::FromEnvironment();
+    ASSERT_EQ(unsetenv("MOONCAKE_S3_KEY_PREFIX"), 0);
+    EXPECT_EQ(config.key_prefix, "mint-run-20261024");
+}
+
+TEST(S3ObjectStorageConfigTest, RejectsPrefixThatIsOnlySlashes) {
+    S3ObjectStorageConfig config;
+    config.endpoint = "https://oss.example.test";
+    config.bucket = "bucket";
+    config.region = "region";
+    for (const std::string prefix : {"/", "///"}) {
+        config.key_prefix = prefix;
+        EXPECT_FALSE(config.Validate()) << prefix;
+    }
+    config.key_prefix = "isolated-prefix/";
+    EXPECT_TRUE(config.Validate());
 }
 }  // namespace mooncake
