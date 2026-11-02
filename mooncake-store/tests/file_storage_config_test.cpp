@@ -56,6 +56,7 @@ struct FileStorageEnvironment {
     ScopedEnvVar total_size_limit{"MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"};
     ScopedEnvVar heartbeat_interval{
         "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS"};
+    ScopedEnvVar offload_poll_interval{"MOONCAKE_OFFLOAD_POLL_INTERVAL_MS"};
     ScopedEnvVar s3_metadata_refresh_interval{
         "MOONCAKE_OFFLOAD_S3_METADATA_REFRESH_INTERVAL_SECONDS"};
     ScopedEnvVar client_buffer_gc_interval{
@@ -85,6 +86,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(config.offload_poll_interval_ms, 0u);
     EXPECT_EQ(config.s3_metadata_refresh_interval_seconds, 0u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
@@ -307,6 +309,33 @@ TEST_F(FileStorageConfigTest, ValidateSuccessWithValidConfig) {
     config.heartbeat_interval_seconds = 5;
 
     EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, ReadsOffloadPollInterval) {
+    env.heartbeat_interval.Set("1");
+    env.offload_poll_interval.Set("100");
+    const auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.heartbeat_interval_seconds, 1u);
+    EXPECT_EQ(config.offload_poll_interval_ms, 100u);
+
+    env.offload_poll_interval.Set("abc");
+    EXPECT_EQ(FileStorageConfig::FromEnvironment().offload_poll_interval_ms,
+              0u);
+}
+
+TEST_F(FileStorageConfigTest, ValidateOffloadPollIntervalBound) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path.string();
+    config.heartbeat_interval_seconds = 1;
+    config.offload_poll_interval_ms = 0;
+    EXPECT_TRUE(config.Validate());
+    config.offload_poll_interval_ms = 100;
+    EXPECT_TRUE(config.Validate());
+    config.offload_poll_interval_ms = 1000;
+    EXPECT_TRUE(config.Validate());
+    // A poll slower than the heartbeat would silently delay maintenance.
+    config.offload_poll_interval_ms = 1001;
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidStoragePath) {

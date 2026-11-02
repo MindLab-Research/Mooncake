@@ -255,13 +255,35 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         });
     }
     heartbeat_thread_ = std::thread([this]() {
+        const auto heartbeat_interval = std::chrono::milliseconds(
+            static_cast<int64_t>(config_.heartbeat_interval_seconds) * 1000);
+        // 0 keeps the legacy single cadence. A non-zero value adds offload-only
+        // ticks between heartbeats so a new object is picked up within one
+        // poll interval instead of one heartbeat interval.
+        const auto tick_interval =
+            config_.offload_poll_interval_ms == 0
+                ? heartbeat_interval
+                : std::chrono::milliseconds(config_.offload_poll_interval_ms);
         LOG(INFO) << "Starting periodic task with interval: "
                   << config_.heartbeat_interval_seconds
-                  << "s, running is: " << heartbeat_running_.load();
+                  << "s, offload poll interval: " << tick_interval.count()
+                  << "ms, running is: " << heartbeat_running_.load();
+        // The first tick runs the full heartbeat, as before.
+        auto next_maintenance = std::chrono::steady_clock::now();
+        // After a failed tick (master unreachable, backend error) the extra
+        // offload-only ticks pause until the next full heartbeat, so retries
+        // and their error logs stay at the heartbeat_interval_seconds rate.
+        bool fast_ticks_paused = false;
         while (heartbeat_running_.load()) {
-            Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
+            const auto now = std::chrono::steady_clock::now();
+            const bool run_maintenance = now >= next_maintenance;
+            if (run_maintenance) {
+                next_maintenance = now + heartbeat_interval;
+            }
+            if (run_maintenance || !fast_ticks_paused) {
+                fast_ticks_paused = !Heartbeat(run_maintenance).has_value();
+            }
+            std::this_thread::sleep_for(tick_interval);
         }
     });
     client_buffer_gc_running_.store(true);
@@ -712,7 +734,7 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     return enable_offloading;
 }
 
-tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
+tl::expected<void, ErrorCode> FileStorage::Heartbeat(bool run_maintenance) {
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -734,7 +756,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         rescan_future_ = std::future<void>();
     }
 
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
+    if (run_maintenance && metadata_resync_pending_.load() &&
+        !rescan_future_.valid()) {
         LOG(INFO) << "Starting background metadata rescan";
         rescan_future_ = std::async(std::launch::async, [this]() {
             auto result = ReRegisterOffloadedObjects();
@@ -834,9 +857,11 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 2: Poll whether master requested a full SSD clear ===
-    auto remove_all_result = client_->PollRemoveAll();
-    if (remove_all_result && remove_all_result.value()) {
-        RemoveAll();
+    if (run_maintenance) {
+        auto remove_all_result = client_->PollRemoveAll();
+        if (remove_all_result && remove_all_result.value()) {
+            RemoveAll();
+        }
     }
 
     // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
@@ -851,6 +876,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
+
+    // Offload-only ticks (see offload_poll_interval_ms) stop here; the
+    // maintenance below keeps its heartbeat_interval_seconds cadence.
+    if (!run_maintenance) {
+        return {};
+    }
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;

@@ -184,9 +184,16 @@ class FileStorage {
      *    promotion tasks queued by the master (mirror of step 1+2 in the
      *    reverse direction).
      * 5. Runs proactive local-disk watermark eviction.
+     *
+     * @param run_maintenance When false, only steps 1-3 run (fetch and upload
+     *        offload work). The heartbeat thread passes false on the extra
+     *        ticks that offload_poll_interval_ms adds between two
+     *        heartbeat_interval_seconds boundaries, so PollRemoveAll,
+     *        promotion, watermark eviction and the pending metadata rescan
+     *        keep their original cadence.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<void, ErrorCode> Heartbeat();
+    tl::expected<void, ErrorCode> Heartbeat(bool run_maintenance = true);
 
     /**
      * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.

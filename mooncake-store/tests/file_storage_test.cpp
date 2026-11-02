@@ -42,6 +42,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_POLL_INTERVAL_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS");
         UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
@@ -180,8 +181,8 @@ class FileStorageTest : public ::testing::Test {
 
     void AssertHeartbeatEvictsAllKeys(
         FileStorage& fileStorage, const std::vector<std::string>& expected_keys,
-        const std::unordered_map<std::string, std::vector<Slice>>&
-            batch_object) {
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        bool offload_only_tick_first = false) {
         ASSERT_TRUE(fileStorage.storage_backend_->Init());
         {
             MutexLocker locker(&fileStorage.offloading_mutex_);
@@ -214,6 +215,17 @@ class FileStorageTest : public ::testing::Test {
                 has_local_disk_replica |= replica.is_local_disk_replica();
             }
             EXPECT_TRUE(has_local_disk_replica);
+        }
+
+        if (offload_only_tick_first) {
+            // An offload-only tick (offload_poll_interval_ms) must leave the
+            // watermark eviction to the next full heartbeat.
+            ASSERT_TRUE(fileStorage.Heartbeat(false).has_value());
+            for (const auto& key : expected_keys) {
+                auto exists = fileStorage.storage_backend_->IsExist(key);
+                ASSERT_TRUE(exists.has_value());
+                EXPECT_TRUE(exists.value()) << key;
+            }
         }
 
         auto heartbeat_result = fileStorage.Heartbeat();
@@ -792,6 +804,53 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
     }
 
     AssertHeartbeatEvictsAllKeys(file_storage, expected_keys, batch_object);
+}
+
+TEST_F(FileStorageTest, OffloadOnlyHeartbeatTickSkipsDiskWatermarkEviction) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "offload_only_tick_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    auto mount_result = client.value()->MountLocalDiskSegment(true);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountLocalDiskSegment failed: " << toString(mount_result.error());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/offload_only_tick_watermark";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.disk_eviction_high_watermark_ratio = 1e-12;
+    config.disk_eviction_low_watermark_ratio = 0.5e-12;
+    fs::create_directories(config.storage_filepath);
+
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::vector<std::string> expected_keys = {
+        "heartbeat_key_1", "heartbeat_key_2", "heartbeat_key_3"};
+    for (size_t i = 0; i < expected_keys.size(); ++i) {
+        auto buffer = std::make_unique<char[]>(512);
+        std::memset(buffer.get(), static_cast<int>('a' + i), 512);
+        batch_object.emplace(expected_keys[i],
+                             std::vector<Slice>{Slice{buffer.get(), 512}});
+        buffers.push_back(std::move(buffer));
+    }
+
+    AssertHeartbeatEvictsAllKeys(file_storage, expected_keys, batch_object,
+                                 /*offload_only_tick_first=*/true);
 }
 
 // A drain deregisters the disk tier; the heartbeat re-mounts the segment
