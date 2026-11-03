@@ -1,8 +1,11 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <limits>
+#include <system_error>
+#include <thread>
 
 #include "storage/distributed/dfs_global_allocator.h"
 #include "types.h"
@@ -11,6 +14,10 @@
 namespace mooncake {
 
 namespace {
+
+// Upper bound on concurrent object PUTs in one offload batch. Bounded so a
+// large batch cannot open an unbounded number of cloud connections at once.
+constexpr size_t kMaxConcurrentObjectUploads = 8;
 
 bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
                                const DistributedStorageConfig& config) {
@@ -129,8 +136,16 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    std::vector<std::string> success_keys;
-    std::vector<StorageObjectMetadata> success_metas;
+    struct PreparedObject {
+        const std::string* key;
+        std::vector<iovec> iovs;
+        size_t total_size = 0;
+        // Written by exactly one upload worker; read only after every worker
+        // has been joined.
+        bool uploaded = false;
+    };
+    std::vector<PreparedObject> prepared;
+    prepared.reserve(batch_object.size());
     for (const auto& [key, slices] : batch_object) {
         if (slices.size() >
             static_cast<size_t>(std::numeric_limits<int>::max())) {
@@ -138,7 +153,6 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                          << ": slice count exceeds INT_MAX";
             continue;
         }
-        const int iovcnt = static_cast<int>(slices.size());
 
         std::vector<iovec> iovs;
         iovs.reserve(slices.size());
@@ -157,17 +171,60 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                          << ": total slice size overflows size_t";
             continue;
         }
+        prepared.push_back({&key, std::move(iovs), total_size});
+    }
 
-        auto result = object_storage_adapter_->PutV(key, iovs.data(), iovcnt);
-        if (!result) {
-            LOG(WARNING) << "Failed to offload key " << key << ": "
-                         << static_cast<int>(result.error());
-            continue;
+    // Each PutV is an independent, self-fenced upload of one logical key
+    // (its own admission marker and multipart upload id), and the adapter's
+    // object-storage client is safe for concurrent requests. Uploading the
+    // batch serially made every object in it wait for all the others: one
+    // cloud PUT per object, end to end. The caller still holds the durable
+    // object lifecycle lock for the whole batch, and completion is still
+    // reported once below, so Master-visible semantics are unchanged.
+    std::atomic<size_t> next_object{0};
+    auto upload_worker = [&]() {
+        for (size_t i = next_object.fetch_add(1); i < prepared.size();
+             i = next_object.fetch_add(1)) {
+            auto& object = prepared[i];
+            auto result = object_storage_adapter_->PutV(
+                *object.key, object.iovs.data(),
+                static_cast<int>(object.iovs.size()));
+            if (!result) {
+                LOG(WARNING) << "Failed to offload key " << *object.key << ": "
+                             << static_cast<int>(result.error());
+                continue;
+            }
+            object.uploaded = true;
         }
+    };
+    const size_t worker_count =
+        std::min(prepared.size(), kMaxConcurrentObjectUploads);
+    std::vector<std::thread> workers;
+    if (worker_count > 1) {
+        workers.reserve(worker_count - 1);
+        for (size_t i = 1; i < worker_count; ++i) {
+            try {
+                workers.emplace_back(upload_worker);
+            } catch (const std::system_error& e) {
+                // Fewer workers only means less overlap; the calling thread
+                // below drains whatever the started workers do not take.
+                LOG(WARNING)
+                    << "Offload upload worker not started: " << e.what();
+                break;
+            }
+        }
+    }
+    upload_worker();
+    for (auto& worker : workers) worker.join();
 
-        success_keys.push_back(key);
-        success_metas.emplace_back(-1, 0, static_cast<int64_t>(key.size()),
-                                   static_cast<int64_t>(total_size), "");
+    std::vector<std::string> success_keys;
+    std::vector<StorageObjectMetadata> success_metas;
+    for (const auto& object : prepared) {
+        if (!object.uploaded) continue;
+        success_keys.push_back(*object.key);
+        success_metas.emplace_back(-1, 0,
+                                   static_cast<int64_t>(object.key->size()),
+                                   static_cast<int64_t>(object.total_size), "");
     }
 
     if (complete_handler && !success_keys.empty()) {
