@@ -186,15 +186,22 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         for (size_t i = next_object.fetch_add(1); i < prepared.size();
              i = next_object.fetch_add(1)) {
             auto& object = prepared[i];
-            auto result = object_storage_adapter_->PutV(
-                *object.key, object.iovs.data(),
-                static_cast<int>(object.iovs.size()));
-            if (!result) {
+            try {
+                auto result = object_storage_adapter_->PutV(
+                    *object.key, object.iovs.data(),
+                    static_cast<int>(object.iovs.size()));
+                if (!result) {
+                    LOG(WARNING) << "Failed to offload key " << *object.key
+                                 << ": " << static_cast<int>(result.error());
+                    continue;
+                }
+                object.uploaded = true;
+            } catch (...) {
+                // An exception escaping a worker would terminate the provider.
+                // Leave this key pending for the caller's normal retry path.
                 LOG(WARNING) << "Failed to offload key " << *object.key << ": "
-                             << static_cast<int>(result.error());
-                continue;
+                             << "object storage adapter threw an exception";
             }
-            object.uploaded = true;
         }
     };
     const size_t worker_count =

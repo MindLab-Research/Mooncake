@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -33,6 +34,8 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
    public:
     std::map<std::string, std::string> objects;
     std::unordered_set<std::string> fail_keys;
+    std::unordered_set<std::string> throw_keys;
+    std::unordered_set<std::string> unknown_throw_keys;
     int init_calls = 0;
     int putv_calls = 0;
     int get_calls = 0;
@@ -91,6 +94,12 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
         std::lock_guard lock(putv_mutex);
         --putv_in_flight;
         ++putv_calls;
+        if (throw_keys.contains(logical_key)) {
+            throw std::runtime_error("injected upload exception");
+        }
+        if (unknown_throw_keys.contains(logical_key)) {
+            throw 42;
+        }
         if (fail_keys.contains(logical_key)) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -617,6 +626,93 @@ TEST_F(ObjectStorageAdapterTest,
     }
     for (const auto& key : adapter->fail_keys) {
         EXPECT_FALSE(adapter->objects.contains(key));
+    }
+}
+
+TEST_F(ObjectStorageAdapterTest,
+       BatchOffloadContainsUploadExceptionsAndCompletesOtherKeys) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+    adapter->putv_delay = std::chrono::milliseconds(10);
+
+    constexpr int kObjects = 16;
+    std::vector<std::string> values;
+    values.reserve(kObjects);
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    std::map<std::string, int64_t> expected;
+    for (int i = 0; i < kObjects; ++i) {
+        const auto key = "key-" + std::to_string(i);
+        values.emplace_back(i + 1, 'x');
+        batch[key] = {{values.back().data(), values.back().size()}};
+        if (i % 4 == 0) {
+            adapter->throw_keys.insert(key);
+        } else if (i % 4 == 1) {
+            adapter->unknown_throw_keys.insert(key);
+        } else if (i % 4 == 2) {
+            adapter->fail_keys.insert(key);
+        } else {
+            expected[key] = values.back().size();
+        }
+    }
+    int handler_calls = 0;
+    std::map<std::string, int64_t> completed;
+    auto result = backend->BatchOffload(
+        batch, [&](const std::vector<std::string>& keys,
+                   std::vector<StorageObjectMetadata>& metadata) {
+            ++handler_calls;
+            EXPECT_EQ(adapter->putv_in_flight.load(), 0);
+            EXPECT_EQ(keys.size(), metadata.size());
+            for (size_t i = 0; i < std::min(keys.size(), metadata.size());
+                 ++i) {
+                completed[keys[i]] = metadata[i].data_size;
+            }
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(result);
+    EXPECT_EQ(*result, static_cast<int64_t>(expected.size()));
+    EXPECT_EQ(adapter->putv_calls, kObjects);
+    EXPECT_EQ(handler_calls, 1);
+    EXPECT_EQ(completed, expected);
+    EXPECT_EQ(adapter->objects.size(), expected.size());
+    for (const auto& [key, size] : expected) {
+        EXPECT_EQ(adapter->objects.at(key), std::string(size, 'x'));
+    }
+}
+
+TEST_F(ObjectStorageAdapterTest,
+       BatchOffloadSkipsCompletionWhenEveryUploadThrows) {
+    // Cover both the caller-only path and a batch with multiple workers.
+    for (int count : {1, 16}) {
+        FakeObjectStorageAdapter* adapter = nullptr;
+        auto backend = MakeObjectStorageBackend(adapter);
+        ASSERT_TRUE(backend->Init());
+        std::string value = "value";
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        for (int i = 0; i < count; ++i) {
+            const auto key = "key-" + std::to_string(i);
+            batch[key] = {{value.data(), value.size()}};
+            if (i % 2 == 0) {
+                adapter->throw_keys.insert(key);
+            } else {
+                adapter->unknown_throw_keys.insert(key);
+            }
+        }
+        int handler_calls = 0;
+        auto result = backend->BatchOffload(
+            batch, [&](const std::vector<std::string>&,
+                       std::vector<StorageObjectMetadata>&) {
+                ++handler_calls;
+                return ErrorCode::OK;
+            });
+
+        ASSERT_TRUE(result);
+        EXPECT_EQ(*result, 0);
+        EXPECT_EQ(handler_calls, 0);
+        EXPECT_EQ(adapter->putv_calls, count);
+        EXPECT_EQ(adapter->putv_in_flight.load(), 0);
+        EXPECT_TRUE(adapter->objects.empty());
     }
 }
 
