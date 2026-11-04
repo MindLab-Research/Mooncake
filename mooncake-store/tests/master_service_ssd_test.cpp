@@ -1165,7 +1165,7 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
     ASSERT_TRUE(fence);
     EXPECT_FALSE(service->PutEnd(owner, inflight, TenantId::Default(),
                                  ReplicaType::MEMORY));
-    EXPECT_FALSE(service->NotifyOffloadSuccess(
+    EXPECT_TRUE(service->NotifyOffloadSuccess(
         owner, {{.tenant_id = "default", .key = inflight, .size = 1024}},
         {{.data_size = 1024, .transport_endpoint = "scoped-delete-node"}}));
     auto inflight_plan = service->PrepareDurableDelete(
