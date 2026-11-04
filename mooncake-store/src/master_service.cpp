@@ -6671,7 +6671,6 @@ void MasterService::RecoverDurableDeletions() {
                         UuidToString(deletion.operation_id) ||
                     found->second->namespace_identity !=
                         deletion.namespace_identity ||
-
                     (deletion.completed && !found->second->completed)) {
                     throw std::runtime_error(
                         "Snapshot deletion missing from canonical journal");
@@ -6691,7 +6690,6 @@ void MasterService::RecoverDurableDeletions() {
         if (old != state.durable_deletions.end() &&
             (old->second.operation_id != operation ||
              old->second.namespace_identity != record.namespace_identity ||
-
              (old->second.completed && !record.completed))) {
             throw std::runtime_error(
                 "Snapshot conflicts with deletion journal");

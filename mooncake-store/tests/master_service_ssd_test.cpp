@@ -1188,6 +1188,10 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
+    PutAndOffload(*service, owner, parent, 1024, "scoped-delete-node");
+    auto root_plan = PrepareDeletion(*service, parent, anchor);
+    ASSERT_TRUE(root_plan);
+    EXPECT_TRUE(FinishPlannedDeletion(*service, parent, *root_plan));
     auto anchor_plan = PrepareDeletion(*service, anchor, anchor);
     ASSERT_TRUE(anchor_plan);
     EXPECT_TRUE(FinishPlannedDeletion(*service, anchor, *anchor_plan));
@@ -1203,6 +1207,35 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
     auto recovered_missing = PrepareDeletion(*recovered, missing_key, anchor);
     ASSERT_TRUE(recovered_missing);
     EXPECT_TRUE(recovered_missing->completed);
+}
+
+TEST_F(MasterServiceSSDTest, ScopedDeleteRejectsForeignProviderNamespace) {
+    auto service = CreateDeletionService();
+    const auto anchor_owner = generate_uuid();
+    const auto foreign_owner = generate_uuid();
+    MountMemoryAndLocalDisk(*service, anchor_owner, "anchor-owner", 0x770000000);
+    ::mooncake::test::MountMemoryAndLocalDisk(*service, foreign_owner,
+                                            "foreign-owner", 0x780000000);
+    auto foreign_namespace = TestNamespace();
+    foreign_namespace.bucket = "other-bucket";
+    ASSERT_TRUE(RegisterProvider(*service, foreign_owner, foreign_namespace));
+    const std::string anchor = "artifact/.mint-publication/intent";
+    const std::string key = "artifact/.mint-parts/foreign";
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "anchor-owner";
+    ASSERT_TRUE(service->NotifyOffloadSuccess(
+        anchor_owner, {{"default", anchor, 1024}}, {metadata}));
+    metadata.transport_endpoint = "foreign-owner";
+    ASSERT_TRUE(service->NotifyOffloadSuccess(
+        foreign_owner, {{"default", key, 1024}}, {metadata}));
+    auto rejected = PrepareDeletion(*service, key, anchor);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+    auto status = service->GetDurableDeleteStatus(key, TenantId::Default());
+    ASSERT_TRUE(status);
+    EXPECT_EQ(*status, 0);
+    EXPECT_TRUE(service->GetReplicaListForAdmin(key, TenantId::Default()));
 }
 
 TEST_F(MasterServiceSSDTest, DeleteStatusUsesOnlyTenantScopedDurableJournal) {
@@ -1268,9 +1301,12 @@ TEST_F(MasterServiceSSDTest, PendingAnchorCanRecoverWithoutMetadata) {
     ASSERT_TRUE(plan);
     EXPECT_EQ(plan->operation_id, operation);
     ASSERT_EQ(plan->providers.size(), 1);
+    auto snapshot = Snapshot(*service);
+    ASSERT_TRUE(snapshot);
     EXPECT_TRUE(FinishPlannedDeletion(*service, anchor, *plan));
     service.reset();
     service = CreateDeletionService();
+    ASSERT_TRUE(Restore(*service, *snapshot));
     auto replayed = PrepareDeletion(*service, anchor, anchor);
     ASSERT_TRUE(replayed);
     EXPECT_TRUE(replayed->completed);

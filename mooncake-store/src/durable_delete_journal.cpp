@@ -15,7 +15,7 @@ namespace {
 // Tombstones are permanent. Do not impose a lifetime key-count ceiling.
 // Recovery streams the journal; capacity is provisioned as persistent metadata.
 constexpr size_t kMaxFieldBytes = 1024;
-constexpr size_t kMaxRecordBytes = 4 * kMaxFieldBytes * 2 + 128;
+constexpr size_t kMaxRecordBytes = 5 * kMaxFieldBytes * 2 + 128;
 
 std::string Hex(const std::string& value) {
     constexpr char digits[] = "0123456789abcdef";

@@ -78,6 +78,20 @@ TEST_F(DurableDeleteJournalTest, ScopedAnchorAndCompletionSurviveRecovery) {
     EXPECT_FALSE(restored.Commit(conflict));
 }
 
+TEST_F(DurableDeleteJournalTest, MaximumScopedRecordReplays) {
+    DurableDeleteJournal::Record record{
+        std::string(1024, 't'), std::string(1024, 'k'), std::string(1024, 'o'),
+        false, std::string(1024, 's'), 0, std::string(1024, 'a')};
+    {
+        DurableDeleteJournal journal(path);
+        ASSERT_TRUE(journal.Commit(record));
+    }
+    DurableDeleteJournal restored(path);
+    const auto recovered = restored.Lookup(record.tenant, record.key);
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered->scope_anchor_key, record.scope_anchor_key);
+}
+
 TEST_F(DurableDeleteJournalTest, ProcessExitPreservesAcknowledgedFence) {
     const auto pid = fork();
     ASSERT_GE(pid, 0);

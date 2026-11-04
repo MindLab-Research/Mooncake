@@ -41,6 +41,14 @@ class JournalRepairTest(unittest.TestCase):
         self.assertEqual(repair.parse_record(line.splitlines(keepends=True)[0])[-1],
                          b"artifact/.mint-publication/intent")
         self.assertEqual(repair.inspect(self._write_temp(line))["damaged"], [])
+        conflict = scoped_record() + scoped_record(done=True, anchor=b"foreign/intent")
+        self.assertTrue(repair.inspect(self._write_temp(conflict))["damaged"])
+
+    def test_maximum_v4_record_is_recoverable(self):
+        field = (b"x" * 1024).hex().encode()
+        body = b"v4 " + b" ".join([field, field, field, b"0", field, b"0", field])
+        line = body + b" " + str(zlib.crc32(body)).encode() + b"\n"
+        self.assertEqual(repair.inspect(self._write_temp(line))["damaged"], [])
 
     def _write_temp(self, data):
         path = self.root / "scoped-journal"

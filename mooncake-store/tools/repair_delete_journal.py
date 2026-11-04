@@ -20,7 +20,7 @@ import stat
 import tempfile
 import zlib
 
-MAX_RECORD = 4 * 1024 * 2 + 128
+MAX_RECORD = 5 * 1024 * 2 + 128
 
 
 def parse_record(line):
