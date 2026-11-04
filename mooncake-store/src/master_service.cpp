@@ -6671,8 +6671,7 @@ void MasterService::RecoverDurableDeletions() {
                         UuidToString(deletion.operation_id) ||
                     found->second->namespace_identity !=
                         deletion.namespace_identity ||
-                    found->second->scope_anchor_key !=
-                        deletion.scope_anchor_key ||
+
                     (deletion.completed && !found->second->completed)) {
                     throw std::runtime_error(
                         "Snapshot deletion missing from canonical journal");
@@ -6692,7 +6691,7 @@ void MasterService::RecoverDurableDeletions() {
         if (old != state.durable_deletions.end() &&
             (old->second.operation_id != operation ||
              old->second.namespace_identity != record.namespace_identity ||
-             old->second.scope_anchor_key != record.scope_anchor_key ||
+
              (old->second.completed && !record.completed))) {
             throw std::runtime_error(
                 "Snapshot conflicts with deletion journal");
@@ -6874,7 +6873,7 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
             const auto anchor_delete =
                 anchor_state->durable_deletions.find(scope_anchor_key);
             if (anchor_delete == anchor_state->durable_deletions.end() ||
-                !anchor_delete->second.completed ||
+                (!anchor_delete->second.completed && key != scope_anchor_key) ||
                 anchor_delete->second.scope_anchor_key != scope_anchor_key)
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             scoped_namespace = anchor_delete->second.namespace_identity;
@@ -6937,6 +6936,7 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         if (accessor.Exists()) {
             const auto& metadata = accessor.Get();
+            std::lock_guard provider_lock(durable_provider_mutex_);
             if (metadata.RemainingReadLeaseMs() != 0)
                 return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
             for (const auto& replica : metadata.GetAllReplicas()) {

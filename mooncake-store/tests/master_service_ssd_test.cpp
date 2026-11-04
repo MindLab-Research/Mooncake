@@ -80,8 +80,9 @@ class MasterServiceSSDTest : public ::testing::Test {
     }
 
     static auto PrepareDeletion(MasterService& service,
-                                const std::string& key) {
-        return service.PrepareDurableDelete(key, TenantId::Default());
+                                const std::string& key,
+                                const std::string& anchor = {}) {
+        return service.PrepareDurableDelete(key, TenantId::Default(), anchor);
     }
 
     static tl::expected<UUID, ErrorCode> BeginDeletion(MasterService& service,
@@ -1151,8 +1152,7 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
     ASSERT_TRUE(provider(anchor));
 
     const auto missing_key = parent + "/.mint-parts/missing";
-    auto missing = service->PrepareDurableDelete(
-        missing_key, TenantId::Default(), anchor);
+    auto missing = PrepareDeletion(*service, missing_key, anchor);
     ASSERT_TRUE(missing);
     ASSERT_EQ(missing->providers.size(), 1);
     EXPECT_FALSE(service->PutStart(owner, missing_key, TenantId::Default(), 1,
@@ -1161,23 +1161,22 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
 
     const auto inflight = parent + "/.mint-parts/inflight";
     ASSERT_TRUE(put(inflight));
-    auto fence = BeginDeletion(*service, inflight);
+    auto fence = PrepareDeletion(*service, inflight, anchor);
     ASSERT_TRUE(fence);
     EXPECT_FALSE(service->PutEnd(owner, inflight, TenantId::Default(),
                                  ReplicaType::MEMORY));
     EXPECT_TRUE(service->NotifyOffloadSuccess(
         owner, {{.tenant_id = "default", .key = inflight, .size = 1024}},
         {{.data_size = 1024, .transport_endpoint = "scoped-delete-node"}}));
-    auto inflight_plan = service->PrepareDurableDelete(
-        inflight, TenantId::Default(), anchor);
+    auto inflight_plan = PrepareDeletion(*service, inflight, anchor);
     ASSERT_TRUE(inflight_plan);
     EXPECT_TRUE(FinishPlannedDeletion(*service, inflight, *inflight_plan));
 
     for (const auto& invalid : {parent + "-suffix/key",
-                                "other-artifact/.mint-parts/key",
+                                std::string("other-artifact/.mint-parts/key"),
                                 parent + "/.mint-parts/key"}) {
-        auto result = service->PrepareDurableDelete(
-            invalid, TenantId::Default(),
+        auto result = PrepareDeletion(
+            *service, invalid,
             invalid == parent + "/.mint-parts/key"
                 ? "other-artifact/.mint-publication/intent"
                 : anchor);
@@ -1185,22 +1184,49 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
-    auto anchor_plan = service->PrepareDurableDelete(
-        anchor, TenantId::Default(), anchor);
+    auto anchor_plan = PrepareDeletion(*service, anchor, anchor);
     ASSERT_TRUE(anchor_plan);
     EXPECT_TRUE(FinishPlannedDeletion(*service, anchor, *anchor_plan));
-    EXPECT_TRUE(service->PrepareDurableDelete(
-        missing_key, TenantId::Default(), anchor)->completed);
+    auto repeated = PrepareDeletion(*service, missing_key, anchor);
+    ASSERT_TRUE(repeated);
+    EXPECT_TRUE(repeated->completed);
 
     service.reset();
     auto recovered = CreateDeletionService();
     const auto fresh = generate_uuid();
     MountMemoryAndLocalDisk(*recovered, fresh, "scoped-recovery-node",
                             0x750000000);
-    auto recovered_missing = recovered->PrepareDurableDelete(
-        missing_key, TenantId::Default(), anchor);
+    auto recovered_missing = PrepareDeletion(*recovered, missing_key, anchor);
     ASSERT_TRUE(recovered_missing);
     EXPECT_TRUE(recovered_missing->completed);
+}
+
+TEST_F(MasterServiceSSDTest, PendingAnchorCanRecoverWithoutMetadata) {
+    const std::string anchor = "artifact/.mint-publication/intent";
+    const auto operation = generate_uuid();
+    {
+        DurableDeleteJournal journal(JournalPath());
+        ASSERT_TRUE(journal.Commit({"default", anchor, UuidToString(operation),
+                                    false, TestNamespace().Identity(), 0,
+                                    anchor}));
+    }
+    auto service = CreateDeletionService();
+    const auto owner = generate_uuid();
+    MountMemoryAndLocalDisk(*service, owner, "pending-anchor", 0x760000000);
+    auto child = PrepareDeletion(*service, "artifact/child", anchor);
+    ASSERT_FALSE(child);
+    EXPECT_EQ(child.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto plan = PrepareDeletion(*service, anchor, anchor);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->operation_id, operation);
+    ASSERT_EQ(plan->providers.size(), 1);
+    EXPECT_TRUE(FinishPlannedDeletion(*service, anchor, *plan));
+    service.reset();
+    service = CreateDeletionService();
+    auto replayed = PrepareDeletion(*service, anchor, anchor);
+    ASSERT_TRUE(replayed);
+    EXPECT_TRUE(replayed->completed);
+    EXPECT_EQ(replayed->operation_id, operation);
 }
 
 TEST_F(MasterServiceSSDTest, LegacyJournalOnlyRecoveryCannotAssumeNoReaders) {
