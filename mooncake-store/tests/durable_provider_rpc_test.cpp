@@ -360,7 +360,6 @@ TEST(DurableProviderRpcTest, JournalStatusRoundtripsWithoutProviderOrMetadata) {
 TEST(DurableProviderRpcTest, VersionThreeRequiresSuccessfulFence) {
     DurableDeleteRpcHandler handler;
     std::atomic<int> deletes{0};
-    std::string provider_bytes = "multipart-part-bytes";
     handler.SetExecutor([&](const DurableDeleteCommand& command)
                             -> tl::expected<DurableDeleteReceipt, ErrorCode> {
         ++deletes;
@@ -374,15 +373,13 @@ TEST(DurableProviderRpcTest, VersionThreeRequiresSuccessfulFence) {
     ASSERT_FALSE(missing);
     EXPECT_EQ(missing.error(), ErrorCode::NOT_SUPPORTED);
     handler.SetFenceExecutor(
-        [&](const DurableDeleteCommand&) -> tl::expected<void, ErrorCode> {
-            // A failed pre-delete fence must preserve provider bytes for retry.
+        [](const DurableDeleteCommand&) -> tl::expected<void, ErrorCode> {
             return tl::make_unexpected(ErrorCode::DFS_PERMISSION_DENIED);
         });
     auto failed = async_simple::coro::syncAwait(handler.Execute(command));
     ASSERT_FALSE(failed);
     EXPECT_EQ(failed.error(), ErrorCode::DFS_PERMISSION_DENIED);
     EXPECT_EQ(deletes.load(), 0);
-    EXPECT_EQ(provider_bytes, "multipart-part-bytes");
     handler.StopAndDrain();
 }
 

@@ -44,6 +44,12 @@ class JournalRepairTest(unittest.TestCase):
         conflict = scoped_record() + scoped_record(done=True, anchor=b"foreign/intent")
         self.assertTrue(repair.inspect(self._write_temp(conflict))["damaged"])
 
+    def test_v3_cannot_use_v4_missing_grace_sentinel(self):
+        body = record().rsplit(b" ", 1)[0].replace(b"900000", b"-")
+        line = body + b" " + str(zlib.crc32(body)).encode() + b"\n"
+        with self.assertRaises(ValueError):
+            repair.parse_record(line)
+
     def test_maximum_v4_record_is_recoverable(self):
         field = (b"x" * 1024).hex().encode()
         body = b"v4 " + b" ".join([field, field, field, b"0", field, b"0", field])

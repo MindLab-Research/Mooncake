@@ -44,6 +44,8 @@ def parse_record(line):
             raise ValueError("noncanonical hex field")
         decoded.append(value)
     grace = None
+    if fields[0] == b"v3" and fields[6] == b"-":
+        raise ValueError("missing v3 reader grace")
     if fields[0] in (b"v3", b"v4") and fields[6] != b"-":
         grace = int(fields[6])
         if not 0 <= grace <= 86400000 or str(grace).encode() != fields[6]:
