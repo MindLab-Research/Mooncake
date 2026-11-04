@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <future>
 #include <filesystem>
+#include <fstream>
+#include "tenant_quota_policy_store.h"
 #include <unistd.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <thread>
@@ -334,6 +336,15 @@ TEST(DurableProviderRpcTest, JournalStatusRoundtripsWithoutProviderOrMetadata) {
     }
     WrappedMasterServiceConfig config;
     config.enable_multi_tenants = true;
+    config.default_kv_lease_ttl = 0;
+    const auto policy_path = std::string(directory) + "/tenants.yaml";
+    TenantQuotaPolicySnapshot policy;
+    policy.tenant_quotas = {{"default", 1024}, {"other", 1024}};
+    {
+        std::ofstream out(policy_path);
+        out << FormatTenantQuotaPolicyYaml(policy);
+    }
+    config.tenant_quota_connector_uri = policy_path;
     config.enable_metric_reporting = false;
     config.durable_delete_journal_path = path;
     WrappedMasterService master(config);

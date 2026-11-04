@@ -6,6 +6,8 @@
 #include <atomic>
 #include <memory>
 #include <filesystem>
+#include <fstream>
+#include "tenant_quota_policy_store.h"
 #include <unistd.h>
 #include <mutex>
 #include <shared_mutex>
@@ -1257,6 +1259,14 @@ TEST_F(MasterServiceSSDTest, DeleteStatusUsesOnlyTenantScopedDurableJournal) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.enable_multi_tenants = true;
+    const auto policy_path = journal_directory_ + "/tenants.yaml";
+    TenantQuotaPolicySnapshot policy;
+    policy.tenant_quotas = {{"default", 1024}, {"other", 1024}};
+    {
+        std::ofstream out(policy_path);
+        out << FormatTenantQuotaPolicyYaml(policy);
+    }
+    config.tenant_quota_connector_uri = policy_path;
     config.default_kv_lease_ttl = 0;
     config.durable_delete_journal_path = JournalPath();
     auto service = std::make_unique<MasterService>(config);
