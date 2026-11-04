@@ -6697,8 +6697,10 @@ void MasterService::RecoverDurableDeletions() {
             throw std::runtime_error(
                 "Snapshot conflicts with deletion journal");
         }
-        state.durable_deletions[record.key] = {operation, record.completed,
-                                               record.namespace_identity};
+        state.durable_deletions[record.key] =
+            TenantState::DurableDeleteState{
+                operation, record.completed, record.namespace_identity, {},
+                record.reader_grace_ms, record.scope_anchor_key};
         auto& restored = state.durable_deletions.at(record.key);
         restored.reader_grace_ms = record.reader_grace_ms;
         restored.scope_anchor_key = record.scope_anchor_key;
@@ -7008,7 +7010,7 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
                 FreeDfsReplicas(key, processing);
                 std::lock_guard lock(discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
-                    std::move(processing), std::chrono::steady_clock::now() +
+                    std::move(processing), std::chrono::system_clock::now() +
                                              put_start_release_timeout_sec_);
             }
             accessor.EraseFromProcessing();
@@ -7019,8 +7021,7 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
             local_ssd_manager_.RemoveOffloadFromAll(object_id.tenant_id, key);
         live_state.promotion_tasks.erase(key);
         live_state.promotion_candidates.erase(key);
-        live_state.dynamic_replication_pending.erase(key);
-        live_state.dynamic_replication_leases.erase(key);
+        ClearDynamicReplicationStateForKey(live_state, key);
     }
     if (!durable_delete_journal_->Commit(
             {object_id.tenant_id.value(), key,
@@ -12877,7 +12878,8 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 !state.durable_deletions
                      .emplace(key,
                               TenantState::DurableDeleteState{
-                                  operation_id, completed, namespace_identity})
+                                  operation_id, completed, namespace_identity, {},
+                                  std::nullopt, {}})
                      .second) {
                 return tl::make_unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
