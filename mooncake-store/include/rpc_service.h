@@ -34,6 +34,9 @@ class WrappedMasterService {
 
     ~WrappedMasterService();
 
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(
+        std::string key, std::string tenant_id = "default");
+
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 

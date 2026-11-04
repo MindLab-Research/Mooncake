@@ -226,6 +226,14 @@ bool DurableDeleteJournal::Commit(const Record& record) {
     return true;
 }
 
+std::optional<DurableDeleteJournal::Record> DurableDeleteJournal::Lookup(
+    const std::string& tenant, const std::string& key) const {
+    std::lock_guard lock(mutex_);
+    const auto found = records_.find({tenant, key});
+    if (found == records_.end()) return std::nullopt;
+    return found->second;
+}
+
 std::vector<DurableDeleteJournal::Record> DurableDeleteJournal::Records()
     const {
     std::lock_guard lock(mutex_);

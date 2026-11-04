@@ -306,6 +306,10 @@ class Client {
     tl::expected<void, ErrorCode> RemoveDurable(const ObjectKey& key);
     tl::expected<void, ErrorCode> RemoveDurableScoped(
         const ObjectKey& key, const ObjectKey& scope_anchor_key);
+
+    // Query journal state without starting deletion or changing local caches.
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(const std::string& key);
+
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
                                          bool force = false);
 

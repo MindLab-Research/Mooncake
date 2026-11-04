@@ -36,6 +36,8 @@ class DurableDeleteJournal {
 
     bool Commit(const Record& record);
     std::vector<Record> Records() const;
+    std::optional<Record> Lookup(const std::string& tenant,
+                                 const std::string& key) const;
 
    private:
     void Replay();

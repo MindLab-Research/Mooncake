@@ -117,6 +117,10 @@ pub struct MooncakeStoreLib {
     ) -> ::std::os::raw::c_int,
     pub mooncake_store_get_size:
         unsafe extern "C" fn(store: mooncake_store_t, key: *const ::std::os::raw::c_char) -> i64,
+    pub mooncake_store_durable_delete_status: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int,
     pub mooncake_store_get_hostname: unsafe extern "C" fn(
         store: mooncake_store_t,
         buf_out: *mut ::std::os::raw::c_char,
@@ -203,6 +207,9 @@ impl MooncakeStoreLib {
         let mooncake_store_get_size = __library
             .get(b"mooncake_store_get_size\0")
             .map(|sym| *sym)?;
+        let mooncake_store_durable_delete_status = __library
+            .get(b"mooncake_store_durable_delete_status\0")
+            .map(|sym| *sym)?;
         let mooncake_store_get_hostname = __library
             .get(b"mooncake_store_get_hostname\0")
             .map(|sym| *sym)?;
@@ -242,6 +249,7 @@ impl MooncakeStoreLib {
             mooncake_store_get_replica_status,
             mooncake_store_batch_is_exist,
             mooncake_store_get_size,
+            mooncake_store_durable_delete_status,
             mooncake_store_get_hostname,
             mooncake_store_remove,
             mooncake_store_remove_durable,
@@ -409,6 +417,13 @@ impl MooncakeStoreLib {
     ) -> i64 {
         (self.mooncake_store_get_size)(store, key)
     }
+    pub unsafe fn mooncake_store_durable_delete_status(
+        &self,
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_durable_delete_status)(store, key)
+    }
     pub unsafe fn mooncake_store_get_hostname(
         &self,
         store: mooncake_store_t,
@@ -431,6 +446,14 @@ impl MooncakeStoreLib {
         key: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int {
         (self.mooncake_store_remove_durable)(store, key)
+    }
+    pub unsafe fn mooncake_store_remove_durable_scoped(
+        &self,
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+        scope_anchor_key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int {
+        (self.mooncake_store_remove_durable_scoped)(store, key, scope_anchor_key)
     }
     pub unsafe fn mooncake_store_remove_by_regex(
         &self,

@@ -2417,6 +2417,19 @@ int64_t RealClient::getSize(const std::string &key) {
     return to_py_ret(getSize_internal(key));
 }
 
+tl::expected<int, ErrorCode> RealClient::getDurableDeleteStatus_internal(
+    const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->GetDurableDeleteStatus(key);
+}
+
+int RealClient::getDurableDeleteStatus(const std::string &key) {
+    return to_py_ret(getDurableDeleteStatus_internal(key));
+}
+
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     const UUID &client_id) {

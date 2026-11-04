@@ -261,6 +261,8 @@ TEST_F(DurableDeleteJournalTest, InvalidPathAndCompletionWithoutBeginRefused) {
     EXPECT_FALSE(
         journal.Commit({"tenant", "key", "operation", true, "scope-a"}));
     EXPECT_FALSE(journal.Commit({"tenant", "", "operation", false, "scope-a"}));
+    EXPECT_FALSE(journal.Lookup("tenant", "key"));
+    EXPECT_FALSE(journal.Lookup("other", "key"));
     EXPECT_FALSE(journal.Commit(
         {"tenant", std::string(1025, 'k'), "operation", false, "scope-a"}));
 }

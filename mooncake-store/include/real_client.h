@@ -375,6 +375,9 @@ class RealClient : public PyClient {
      */
     int64_t getSize(const std::string &key);
 
+    // Read-only journal status: 0 unknown, 1 pending, 2 complete, negative error.
+    int getDurableDeleteStatus(const std::string &key);
+
     /**
      * @brief Create a copy task to replicate an object's data to target
      * segments
@@ -756,6 +759,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
+
+    tl::expected<int, ErrorCode> getDurableDeleteStatus_internal(
+        const std::string &key);
 
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,

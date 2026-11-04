@@ -990,6 +990,10 @@ class MasterService {
      */
     void setHttpMetadataServer(HttpMetadataServer* server);
 
+    // Canonical journal only: 0 unknown, 1 pending, 2 durably completed.
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(
+        const std::string& key, const TenantId& tenant_id);
+
     /**
      * @brief Configure cleanup against a separately-deployed HTTP metadata
      * server (not co-located in the master process). The master sends HTTP

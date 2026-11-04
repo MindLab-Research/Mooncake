@@ -81,8 +81,9 @@ class MasterServiceSSDTest : public ::testing::Test {
 
     static auto PrepareDeletion(MasterService& service,
                                 const std::string& key,
-                                const std::string& anchor = {}) {
-        return service.PrepareDurableDelete(key, TenantId::Default(), anchor);
+                                const std::string& anchor = {},
+                                const TenantId& tenant = TenantId::Default()) {
+        return service.PrepareDurableDelete(key, tenant, anchor);
     }
 
     static tl::expected<UUID, ErrorCode> BeginDeletion(MasterService& service,
@@ -1150,6 +1151,9 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
     ASSERT_TRUE(service->PutEnd(owner, anchor, TenantId::Default(),
                                 ReplicaType::MEMORY));
     ASSERT_TRUE(provider(anchor));
+    auto unfenced = service->GetDurableDeleteStatus(anchor, TenantId::Default());
+    ASSERT_TRUE(unfenced);
+    EXPECT_EQ(*unfenced, 0);
 
     const auto missing_key = parent + "/.mint-parts/missing";
     auto missing = PrepareDeletion(*service, missing_key, anchor);
@@ -1199,6 +1203,50 @@ TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
     auto recovered_missing = PrepareDeletion(*recovered, missing_key, anchor);
     ASSERT_TRUE(recovered_missing);
     EXPECT_TRUE(recovered_missing->completed);
+}
+
+TEST_F(MasterServiceSSDTest, DeleteStatusUsesOnlyTenantScopedDurableJournal) {
+    const std::string anchor = "artifact/.mint-publication/intent";
+    const auto pending_operation = generate_uuid();
+    const auto completed_operation = generate_uuid();
+    {
+        DurableDeleteJournal journal(JournalPath());
+        ASSERT_TRUE(journal.Commit({"default", anchor,
+                                    UuidToString(pending_operation), false,
+                                    TestNamespace().Identity(), 0, anchor}));
+        ASSERT_TRUE(journal.Commit({"default", "completed",
+                                    UuidToString(completed_operation), false,
+                                    TestNamespace().Identity(), 0}));
+        ASSERT_TRUE(journal.Commit({"default", "completed",
+                                    UuidToString(completed_operation), true,
+                                    TestNamespace().Identity(), 0}));
+    }
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.default_kv_lease_ttl = 0;
+    config.durable_delete_journal_path = JournalPath();
+    auto service = std::make_unique<MasterService>(config);
+    for (int restart = 0; restart < 2; ++restart) {
+        auto pending = service->GetDurableDeleteStatus(anchor, TenantId::Default());
+        ASSERT_TRUE(pending);
+        EXPECT_EQ(*pending, 1);
+        auto completed = service->GetDurableDeleteStatus("completed", TenantId::Default());
+        ASSERT_TRUE(completed);
+        EXPECT_EQ(*completed, 2);
+        auto unknown = service->GetDurableDeleteStatus("absent", TenantId::Default());
+        ASSERT_TRUE(unknown);
+        EXPECT_EQ(*unknown, 0);
+        auto foreign = service->GetDurableDeleteStatus(anchor, TenantId("other"));
+        ASSERT_TRUE(foreign);
+        EXPECT_EQ(*foreign, 0);
+        auto foreign_delete = PrepareDeletion(*service, anchor, anchor, TenantId("other"));
+        ASSERT_FALSE(foreign_delete);
+        EXPECT_EQ(foreign_delete.error(), ErrorCode::OBJECT_NOT_FOUND);
+        EXPECT_FALSE(service->GetDurableDeleteStatus("", TenantId::Default()));
+        service.reset();
+        service = std::make_unique<MasterService>(config);
+    }
 }
 
 TEST_F(MasterServiceSSDTest, PendingAnchorCanRecoverWithoutMetadata) {

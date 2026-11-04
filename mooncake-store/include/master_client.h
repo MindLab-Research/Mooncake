@@ -427,6 +427,8 @@ class MasterClient {
     tl::expected<void, ErrorCode> RemoveDurableScoped(
         const std::string& key, const std::string& scope_anchor_key);
 
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(const std::string& key);
+
     tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
         const DurableDeleteCommand& command);
 

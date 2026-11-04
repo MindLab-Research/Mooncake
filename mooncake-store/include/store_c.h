@@ -116,6 +116,10 @@ int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
 
 int64_t mooncake_store_get_size(mooncake_store_t store, const char *key);
 
+// Read-only durable deletion journal status: 0 = unknown, 1 = pending,
+// 2 = complete; negative = error. Does not initiate or retry deletion.
+int mooncake_store_durable_delete_status(mooncake_store_t store, const char *key);
+
 int mooncake_store_get_hostname(mooncake_store_t store, char *buf_out,
                                 size_t buf_len);
 

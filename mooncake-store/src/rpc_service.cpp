@@ -99,6 +99,13 @@ WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
+tl::expected<int, ErrorCode> WrappedMasterService::GetDurableDeleteStatus(
+    std::string key, std::string tenant_id) {
+    return WithRequestTenant(tenant_id, [&](const TenantId& tenant) {
+        return master_service_.GetDurableDeleteStatus(key, tenant);
+    });
+}
+
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
@@ -1863,6 +1870,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&WrappedMasterService::GetDurableDeleteStatus>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(

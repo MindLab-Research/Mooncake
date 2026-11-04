@@ -315,6 +315,48 @@ TEST(DurableProviderRpcTest, ProviderShutdownDrainsExecutorAndClosesAdmission) {
     EXPECT_FALSE(async_simple::coro::syncAwait(handler.Execute({})));
 }
 
+TEST(DurableProviderRpcTest, JournalStatusRoundtripsWithoutProviderOrMetadata) {
+    char directory[] = "/tmp/mooncake-status-rpc-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::filesystem::remove_all(path); }
+    } cleanup{directory};
+    const auto path = std::string(directory) + "/journal";
+    const std::string anchor = "artifact/.mint-publication/intent";
+    {
+        DurableDeleteJournal journal(path);
+        const auto op = UuidToString(generate_uuid());
+        ASSERT_TRUE(journal.Commit({"default", anchor, op, false,
+                                    Scope().Identity(), 0, anchor}));
+        ASSERT_TRUE(journal.Commit({"default", anchor, op, true,
+                                    Scope().Identity(), 0, anchor}));
+    }
+    WrappedMasterServiceConfig config;
+    config.enable_multi_tenants = true;
+    config.enable_metric_reporting = false;
+    config.durable_delete_journal_path = path;
+    WrappedMasterService master(config);
+    coro_rpc::coro_rpc_server server(2, 0, "127.0.0.1");
+    RegisterRpcService(server, master);
+    server.async_start();
+    ASSERT_FALSE(server.get_errc());
+    const auto endpoint = "127.0.0.1:" + std::to_string(server.port());
+    MasterClient client(generate_uuid());
+    ASSERT_EQ(client.Connect(endpoint), ErrorCode::OK);
+    auto completed = client.GetDurableDeleteStatus(anchor);
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(*completed, 2);
+    auto missing = client.GetDurableDeleteStatus("absent");
+    ASSERT_TRUE(missing);
+    EXPECT_EQ(*missing, 0);
+    MasterClient foreign(generate_uuid(), nullptr, "other");
+    ASSERT_EQ(foreign.Connect(endpoint), ErrorCode::OK);
+    auto other = foreign.GetDurableDeleteStatus(anchor);
+    ASSERT_TRUE(other);
+    EXPECT_EQ(*other, 0);
+}
+
 TEST(DurableProviderRpcTest, VersionThreeRequiresSuccessfulFence) {
     DurableDeleteRpcHandler handler;
     std::atomic<int> deletes{0};

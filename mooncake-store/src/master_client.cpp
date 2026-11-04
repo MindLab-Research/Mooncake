@@ -219,6 +219,11 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetDurableDeleteStatus> {
+    static constexpr const char* value = "GetDurableDeleteStatus";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::RemoveDurable> {
     static constexpr const char* value = "RemoveDurable";
 };
@@ -989,6 +994,12 @@ MasterClient::GetStorageConfig() {
                              GetStorageConfigResponse>();
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<int, ErrorCode> MasterClient::GetDurableDeleteStatus(
+    const std::string& key) {
+    return invoke_rpc<&WrappedMasterService::GetDurableDeleteStatus, int>(
+        key, tenant_id_.value());
 }
 
 tl::expected<void, ErrorCode> MasterClient::RemoveDurable(

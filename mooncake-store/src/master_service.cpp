@@ -6801,6 +6801,19 @@ tl::expected<void, ErrorCode> MasterService::RegisterDurableDeleteProvider(
     return {};
 }
 
+tl::expected<int, ErrorCode> MasterService::GetDurableDeleteStatus(
+    const std::string& key, const TenantId& tenant_id) {
+    if (key.empty() || !tenant_id.IsValid())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (enable_ha_ || !durable_delete_journal_)
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    const auto record = durable_delete_journal_->Lookup(
+        object_id.tenant_id.value(), object_id.user_key);
+    if (!record) return 0;
+    return record->completed ? 2 : 1;
+}
+
 tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
     const std::string& key, const TenantId& tenant_id,
     const std::string& scope_anchor_key) {
@@ -7004,7 +7017,8 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
         metadata.durable_delete_pending = true;
         SyncKvObjectState(key, metadata, object_id.tenant_id, previous_media);
         if (accessor.InProcessing()) {
-            auto processing = metadata.PopReplicas(&Replica::fn_is_processing);
+            auto processing = PopReplicasWithCacheTotalAccounting(
+                metadata, &Replica::fn_is_processing);
             metadata.ClearPendingSoftPinAction();
             if (!processing.empty()) {
                 FreeDfsReplicas(key, processing);
@@ -7022,6 +7036,9 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
         live_state.promotion_tasks.erase(key);
         live_state.promotion_candidates.erase(key);
         ClearDynamicReplicationStateForKey(live_state, key);
+        // A cancelled PutStart may leave zero replicas. Erase its metadata and
+        // quota reservation; the retained deletion record owns the fence now.
+        if (!metadata.IsValid()) accessor.Erase();
     }
     if (!durable_delete_journal_->Commit(
             {object_id.tenant_id.value(), key,
