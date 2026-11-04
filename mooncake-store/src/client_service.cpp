@@ -3512,6 +3512,15 @@ tl::expected<void, ErrorCode> Client::RemoveDurable(const ObjectKey& key) {
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::RemoveDurableScoped(
+    const ObjectKey& key, const ObjectKey& scope_anchor_key) {
+    if (hot_cache_) hot_cache_->BumpKeyGeneration(key);
+    auto result = master_client_.RemoveDurableScoped(key, scope_anchor_key);
+    if (!result) return tl::unexpected(result.error());
+    if (hot_cache_) hot_cache_->RemoveHotKey(key);
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);

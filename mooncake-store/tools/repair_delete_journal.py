@@ -27,13 +27,16 @@ def parse_record(line):
     if len(line) > MAX_RECORD or not line.endswith(b"\n"):
         raise ValueError("oversized or incomplete record")
     fields = line[:-1].split(b" ")
-    if not fields or fields[0] not in (b"v2", b"v3"):
+    if not fields or fields[0] not in (b"v2", b"v3", b"v4"):
         raise ValueError("unsupported record version")
-    expected = 8 if fields[0] == b"v3" else 7
+    expected = {b"v2": 7, b"v3": 8, b"v4": 9}[fields[0]]
     if len(fields) != expected or fields[4] not in (b"0", b"1"):
         raise ValueError("invalid record fields")
     decoded = []
-    for field in [fields[1], fields[2], fields[3], fields[5]]:
+    encoded_fields = [fields[1], fields[2], fields[3], fields[5]]
+    if fields[0] == b"v4":
+        encoded_fields.append(fields[7])
+    for field in encoded_fields:
         if not field or len(field) > 2048 or len(field) % 2:
             raise ValueError("invalid hex field length")
         value = bytes.fromhex(field.decode("ascii"))
@@ -41,28 +44,31 @@ def parse_record(line):
             raise ValueError("noncanonical hex field")
         decoded.append(value)
     grace = None
-    if fields[0] == b"v3":
+    if fields[0] in (b"v3", b"v4") and fields[6] != b"-":
         grace = int(fields[6])
         if not 0 <= grace <= 86400000 or str(grace).encode() != fields[6]:
             raise ValueError("invalid reader grace")
+    anchor = decoded[4] if fields[0] == b"v4" else b""
+    if fields[0] == b"v4" and not anchor:
+        raise ValueError("empty scope anchor")
     checksum = str(zlib.crc32(b" ".join(fields[:-1]))).encode()
     if checksum != fields[-1]:
         raise ValueError("checksum mismatch")
-    return (*decoded, fields[4] == b"1", grace)
+    return (*decoded[:4], fields[4] == b"1", grace, anchor)
 
 
 def admit(state, record):
-    tenant, key, operation, namespace, completed, grace = record
+    tenant, key, operation, namespace, completed, grace, anchor = record
     identity = (tenant, key)
     old = state.get(identity)
     if old is None:
         if completed:
             raise ValueError("completion without admission")
-    elif old[:2] != (operation, namespace) or old[3] != grace:
-        raise ValueError("conflicting operation, namespace or grace")
+    elif old[:2] != (operation, namespace) or old[3:] != (grace, anchor):
+        raise ValueError("conflicting operation, namespace, grace or anchor")
     elif old[2] and not completed:
         raise ValueError("completed fence regressed")
-    state[identity] = (operation, namespace, completed, grace)
+    state[identity] = (operation, namespace, completed, grace, anchor)
 
 
 @contextlib.contextmanager

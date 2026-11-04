@@ -338,6 +338,8 @@ class RealClient : public PyClient {
 
     int remove(const std::string &key, bool force = false);
     int remove_durable(const std::string &key);
+    int remove_durable_scoped(const std::string &key,
+                              const std::string &scope_anchor_key);
 
     long removeByRegex(const std::string &str, bool force = false);
 

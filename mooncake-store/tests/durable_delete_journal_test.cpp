@@ -58,6 +58,26 @@ TEST_F(DurableDeleteJournalTest, ConcurrentReplayAndConflict) {
     EXPECT_FALSE(restored.Commit(record));
 }
 
+TEST_F(DurableDeleteJournalTest, ScopedAnchorAndCompletionSurviveRecovery) {
+    DurableDeleteJournal::Record record{"tenant", "artifact/root", "operation",
+                                        false, "scope-a", std::nullopt,
+                                        "artifact/.mint-publication/intent"};
+    {
+        DurableDeleteJournal journal(path);
+        ASSERT_TRUE(journal.Commit(record));
+        record.completed = true;
+        ASSERT_TRUE(journal.Commit(record));
+    }
+    DurableDeleteJournal restored(path);
+    ASSERT_EQ(restored.Records().size(), 1);
+    EXPECT_TRUE(restored.Records()[0].completed);
+    EXPECT_EQ(restored.Records()[0].scope_anchor_key,
+              "artifact/.mint-publication/intent");
+    auto conflict = record;
+    conflict.scope_anchor_key = "other/.mint-publication/intent";
+    EXPECT_FALSE(restored.Commit(conflict));
+}
+
 TEST_F(DurableDeleteJournalTest, ProcessExitPreservesAcknowledgedFence) {
     const auto pid = fork();
     ASSERT_GE(pid, 0);

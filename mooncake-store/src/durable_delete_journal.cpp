@@ -46,12 +46,16 @@ std::string Unhex(const std::string& value) {
 }
 
 std::string Encode(const DurableDeleteJournal::Record& record) {
-    auto body = std::string(record.reader_grace_ms ? "v3 " : "v2 ") +
+    const bool scoped = !record.scope_anchor_key.empty();
+    auto body = std::string(scoped ? "v4 " : record.reader_grace_ms ? "v3 " : "v2 ") +
                 Hex(record.tenant) + " " + Hex(record.key) + " " +
                 Hex(record.operation) + " " + (record.completed ? "1" : "0") +
                 " " + Hex(record.namespace_identity);
-    if (record.reader_grace_ms)
-        body += " " + std::to_string(*record.reader_grace_ms);
+    if (record.reader_grace_ms || scoped)
+        body += " " + (record.reader_grace_ms
+                            ? std::to_string(*record.reader_grace_ms)
+                            : std::string("-"));
+    if (scoped) body += " " + Hex(record.scope_anchor_key);
     boost::crc_32_type crc;
     crc.process_bytes(body.data(), body.size());
     return body + " " + std::to_string(crc.checksum()) + "\n";
@@ -62,6 +66,7 @@ bool Valid(const DurableDeleteJournal::Record& record) {
            !record.tenant.empty() && !record.key.empty() &&
            !record.operation.empty() && !record.namespace_identity.empty() &&
            record.namespace_identity.size() <= kMaxFieldBytes &&
+           record.scope_anchor_key.size() <= kMaxFieldBytes &&
            record.tenant.size() <= kMaxFieldBytes &&
            record.key.size() <= kMaxFieldBytes &&
            record.operation.size() <= kMaxFieldBytes;
@@ -135,21 +140,33 @@ void DurableDeleteJournal::Replay() {
         const auto line = pending.substr(0, end + 1);
         pending.erase(0, end + 1);
         std::istringstream input(line);
-        std::string version, tenant, key, operation, phase, scope, checksum,
-            extra;
+        std::string version, tenant, key, operation, phase, scope, grace,
+            anchor, checksum, extra;
         if (!(input >> version >> tenant >> key >> operation >> phase >>
               scope) ||
-            (version != "v2" && version != "v3") ||
+            (version != "v2" && version != "v3" && version != "v4") ||
             (phase != "0" && phase != "1")) {
             throw std::runtime_error("Invalid deletion journal record");
         }
         Record record{Unhex(tenant), Unhex(key), Unhex(operation), phase == "1",
                       Unhex(scope)};
         if (version == "v3") {
-            uint64_t grace;
-            if (!(input >> grace))
+            uint64_t parsed_grace;
+            if (!(input >> parsed_grace))
                 throw std::runtime_error("Invalid deletion reader grace");
-            record.reader_grace_ms = grace;
+            record.reader_grace_ms = parsed_grace;
+        } else if (version == "v4") {
+            if (!(input >> grace >> anchor))
+                throw std::runtime_error("Invalid scoped deletion identity");
+            if (grace != "-") {
+                std::istringstream value(grace);
+                uint64_t parsed_grace;
+                if (!(value >> parsed_grace) || value.peek() !=
+                                               std::char_traits<char>::eof())
+                    throw std::runtime_error("Invalid deletion reader grace");
+                record.reader_grace_ms = parsed_grace;
+            }
+            record.scope_anchor_key = Unhex(anchor);
         }
         if (!(input >> checksum) || input >> extra || !Valid(record) ||
             Encode(record) != line) {
@@ -165,6 +182,7 @@ void DurableDeleteJournal::Replay() {
                    old->second.namespace_identity !=
                        record.namespace_identity ||
                    old->second.reader_grace_ms != record.reader_grace_ms ||
+                   old->second.scope_anchor_key != record.scope_anchor_key ||
                    (old->second.completed && !record.completed)) {
             throw std::runtime_error("Conflicting deletion journal operation");
         }
@@ -184,6 +202,7 @@ bool DurableDeleteJournal::Commit(const Record& record) {
         if (old->second.operation != record.operation ||
             old->second.namespace_identity != record.namespace_identity ||
             old->second.reader_grace_ms != record.reader_grace_ms ||
+            old->second.scope_anchor_key != record.scope_anchor_key ||
             (old->second.completed && !record.completed))
             return false;
         if (old->second.completed == record.completed) return true;

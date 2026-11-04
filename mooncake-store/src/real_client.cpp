@@ -2291,6 +2291,12 @@ int RealClient::remove_durable(const std::string &key) {
     return to_py_ret(client_->RemoveDurable(key));
 }
 
+int RealClient::remove_durable_scoped(const std::string &key,
+                                      const std::string &scope_anchor_key) {
+    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->RemoveDurableScoped(key, scope_anchor_key));
+}
+
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
     const std::string &str, bool force) {
     if (!client_) {

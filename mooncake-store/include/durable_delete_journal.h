@@ -26,6 +26,8 @@ class DurableDeleteJournal {
         std::string namespace_identity;
         // Missing in v2 records: metadata-free recovery must then fail closed.
         std::optional<uint64_t> reader_grace_ms;
+        // Non-empty only for scope-anchor-authorized cleanup operations.
+        std::string scope_anchor_key;
     };
     explicit DurableDeleteJournal(const std::string& path);
     ~DurableDeleteJournal();

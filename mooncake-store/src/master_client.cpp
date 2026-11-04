@@ -223,6 +223,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveDurable> {
     static constexpr const char* value = "RemoveDurable";
 };
 template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveDurableScoped> {
+    static constexpr const char* value = "RemoveDurableScoped";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ValidateDurableDeleteAssignment> {
     static constexpr const char* value = "ValidateDurableDeleteAssignment";
 };
@@ -376,7 +381,10 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                     coro_rpc::coro_rpc_client& client) {
                     if constexpr (std::string_view(
                                       RpcNameTraits<ServiceMethod>::value) ==
-                                  "RemoveDurable") {
+                                      "RemoveDurable" ||
+                                  std::string_view(
+                                      RpcNameTraits<ServiceMethod>::value) ==
+                                      "RemoveDurableScoped") {
                         return client.send_request<ServiceMethod>(
                             coro_rpc::request_config_t{
                                 kDurableCoordinatorDeleteTimeout},
@@ -987,6 +995,12 @@ tl::expected<void, ErrorCode> MasterClient::RemoveDurable(
     const std::string& key) {
     return invoke_rpc<&WrappedMasterService::RemoveDurable, void>(
         key, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::RemoveDurableScoped(
+    const std::string& key, const std::string& scope_anchor_key) {
+    return invoke_rpc<&WrappedMasterService::RemoveDurableScoped, void>(
+        key, scope_anchor_key, tenant_id_.value());
 }
 
 tl::expected<void, ErrorCode> MasterClient::ValidateDurableDeleteAssignment(

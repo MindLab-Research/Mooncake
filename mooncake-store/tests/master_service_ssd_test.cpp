@@ -1130,6 +1130,79 @@ TEST_F(MasterServiceSSDTest, JournalOnlyRecoveryWaitsAndRoutesNewProvider) {
     EXPECT_TRUE(done->completed);
 }
 
+TEST_F(MasterServiceSSDTest, ScopedDeleteFencesMissingAndInflightTargets) {
+    auto service = CreateDeletionService();
+    const auto owner = generate_uuid();
+    MountMemoryAndLocalDisk(*service, owner, "scoped-delete-node", 0x740000000);
+    const std::string parent = "mint/session/state/artifact-uuid";
+    const std::string anchor = parent + "/.mint-publication/intent";
+    auto put = [&](const std::string& key) {
+        return service->PutStart(owner, key, TenantId::Default(), 1024,
+                                 {.replica_num = 1});
+    };
+    auto provider = [&](const std::string& key) {
+        return service->NotifyOffloadSuccess(
+            owner, {{.tenant_id = "default", .key = key, .size = 1024}},
+            {{.data_size = 1024, .transport_endpoint = "scoped-delete-node"}});
+    };
+    ASSERT_TRUE(put(anchor));
+    ASSERT_TRUE(service->PutEnd(owner, anchor, TenantId::Default(),
+                                ReplicaType::MEMORY));
+    ASSERT_TRUE(provider(anchor));
+
+    const auto missing_key = parent + "/.mint-parts/missing";
+    auto missing = service->PrepareDurableDelete(
+        missing_key, TenantId::Default(), anchor);
+    ASSERT_TRUE(missing);
+    ASSERT_EQ(missing->providers.size(), 1);
+    EXPECT_FALSE(service->PutStart(owner, missing_key, TenantId::Default(), 1,
+                                    {.replica_num = 1}));
+    EXPECT_TRUE(FinishPlannedDeletion(*service, missing_key, *missing));
+
+    const auto inflight = parent + "/.mint-parts/inflight";
+    ASSERT_TRUE(put(inflight));
+    auto fence = BeginDeletion(*service, inflight);
+    ASSERT_TRUE(fence);
+    EXPECT_FALSE(service->PutEnd(owner, inflight, TenantId::Default(),
+                                 ReplicaType::MEMORY));
+    EXPECT_FALSE(service->NotifyOffloadSuccess(
+        owner, {{.tenant_id = "default", .key = inflight, .size = 1024}},
+        {{.data_size = 1024, .transport_endpoint = "scoped-delete-node"}}));
+    auto inflight_plan = service->PrepareDurableDelete(
+        inflight, TenantId::Default(), anchor);
+    ASSERT_TRUE(inflight_plan);
+    EXPECT_TRUE(FinishPlannedDeletion(*service, inflight, *inflight_plan));
+
+    for (const auto& invalid : {parent + "-suffix/key",
+                                "other-artifact/.mint-parts/key",
+                                parent + "/.mint-parts/key"}) {
+        auto result = service->PrepareDurableDelete(
+            invalid, TenantId::Default(),
+            invalid == parent + "/.mint-parts/key"
+                ? "other-artifact/.mint-publication/intent"
+                : anchor);
+        EXPECT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    auto anchor_plan = service->PrepareDurableDelete(
+        anchor, TenantId::Default(), anchor);
+    ASSERT_TRUE(anchor_plan);
+    EXPECT_TRUE(FinishPlannedDeletion(*service, anchor, *anchor_plan));
+    EXPECT_TRUE(service->PrepareDurableDelete(
+        missing_key, TenantId::Default(), anchor)->completed);
+
+    service.reset();
+    auto recovered = CreateDeletionService();
+    const auto fresh = generate_uuid();
+    MountMemoryAndLocalDisk(*recovered, fresh, "scoped-recovery-node",
+                            0x750000000);
+    auto recovered_missing = recovered->PrepareDurableDelete(
+        missing_key, TenantId::Default(), anchor);
+    ASSERT_TRUE(recovered_missing);
+    EXPECT_TRUE(recovered_missing->completed);
+}
+
 TEST_F(MasterServiceSSDTest, LegacyJournalOnlyRecoveryCannotAssumeNoReaders) {
     {
         DurableDeleteJournal journal(JournalPath());

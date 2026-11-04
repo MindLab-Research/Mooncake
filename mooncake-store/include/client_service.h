@@ -304,6 +304,8 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> RemoveDurable(const ObjectKey& key);
+    tl::expected<void, ErrorCode> RemoveDurableScoped(
+        const ObjectKey& key, const ObjectKey& scope_anchor_key);
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
                                          bool force = false);
 

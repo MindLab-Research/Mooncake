@@ -133,6 +133,14 @@ int mooncake_store_remove(mooncake_store_t store, const char *key, int force);
 // restart.
 int mooncake_store_remove_durable(mooncake_store_t store, const char *key);
 
+// Scoped permanent deletion with the same completion/lease semantics as above.
+// scope_anchor_key must be B/.mint-publication/intent; key must be B or a
+// descendant of B. The Master validates that the anchor and target belong to
+// the same tenant and registered durable scope. The caller removes the intent
+// last, after all other targets. Native code does not interpret a JSON schema.
+int mooncake_store_remove_durable_scoped(mooncake_store_t store, const char *key,
+                                         const char *scope_anchor_key);
+
 int64_t mooncake_store_remove_by_regex(mooncake_store_t store,
                                        const char *pattern, int force);
 

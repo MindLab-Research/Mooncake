@@ -22,7 +22,31 @@ def record(key=b"key", done=False):
     return body + b" " + str(zlib.crc32(body)).encode() + b"\n"
 
 
+
+def scoped_record(key=b"key", done=False, anchor=b"artifact/.mint-publication/intent"):
+    body = (
+        b"v4 74656e616e74 "
+        + key.hex().encode()
+        + b" 6f70 "
+        + (b"1" if done else b"0")
+        + b" 73636f7065 900000 "
+        + anchor.hex().encode()
+    )
+    return body + b" " + str(zlib.crc32(body)).encode() + b"\n"
+
+
 class JournalRepairTest(unittest.TestCase):
+    def test_v4_anchor_survives_replay_and_conflicts_are_rejected(self):
+        line = scoped_record() + scoped_record(done=True)
+        self.assertEqual(repair.parse_record(line.splitlines(keepends=True)[0])[-1],
+                         b"artifact/.mint-publication/intent")
+        self.assertEqual(repair.inspect(self._write_temp(line))["damaged"], [])
+
+    def _write_temp(self, data):
+        path = self.root / "scoped-journal"
+        path.write_bytes(data)
+        return path
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

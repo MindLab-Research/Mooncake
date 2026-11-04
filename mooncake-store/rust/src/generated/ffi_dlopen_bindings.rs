@@ -131,6 +131,11 @@ pub struct MooncakeStoreLib {
         store: mooncake_store_t,
         key: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int,
+    pub mooncake_store_remove_durable_scoped: unsafe extern "C" fn(
+        store: mooncake_store_t,
+        key: *const ::std::os::raw::c_char,
+        scope_anchor_key: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int,
     pub mooncake_store_remove_by_regex: unsafe extern "C" fn(
         store: mooncake_store_t,
         pattern: *const ::std::os::raw::c_char,
@@ -205,6 +210,9 @@ impl MooncakeStoreLib {
         let mooncake_store_remove_durable = __library
             .get(b"mooncake_store_remove_durable\0")
             .map(|sym| *sym)?;
+        let mooncake_store_remove_durable_scoped = __library
+            .get(b"mooncake_store_remove_durable_scoped\0")
+            .map(|sym| *sym)?;
         let mooncake_store_remove_by_regex = __library
             .get(b"mooncake_store_remove_by_regex\0")
             .map(|sym| *sym)?;
@@ -237,6 +245,7 @@ impl MooncakeStoreLib {
             mooncake_store_get_hostname,
             mooncake_store_remove,
             mooncake_store_remove_durable,
+            mooncake_store_remove_durable_scoped,
             mooncake_store_remove_by_regex,
             mooncake_store_remove_all,
             mooncake_store_register_buffer,

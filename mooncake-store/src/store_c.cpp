@@ -354,6 +354,16 @@ int mooncake_store_remove_durable(mooncake_store_t store, const char *key) {
     }
 }
 
+int mooncake_store_remove_durable_scoped(mooncake_store_t store, const char *key,
+                                         const char *scope_anchor_key) {
+    if (!store || !key || !scope_anchor_key) return -1;
+    try {
+        return as_client(store)->remove_durable_scoped(key, scope_anchor_key);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int64_t mooncake_store_remove_by_regex(mooncake_store_t store,
                                        const char *pattern, int force) {
     if (!store || !pattern) return -1;
