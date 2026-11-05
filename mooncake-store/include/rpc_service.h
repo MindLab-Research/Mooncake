@@ -34,6 +34,9 @@ class WrappedMasterService {
 
     ~WrappedMasterService();
 
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(
+        std::string key, std::string tenant_id = "default");
+
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
@@ -214,6 +217,10 @@ class WrappedMasterService {
     async_simple::coro::Lazy<tl::expected<void, ErrorCode>> RemoveDurable(
         std::string key, std::string tenant_id = "default");
 
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> RemoveDurableScoped(
+        std::string key, std::string scope_anchor_key,
+        std::string tenant_id = "default");
+
     tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
         const DurableDeleteCommand& command);
 
@@ -346,6 +353,9 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> RemoveDurableImpl(
+        std::string key, std::string tenant_id, std::string scope_anchor_key);
+
     MasterService master_service_;
 };
 

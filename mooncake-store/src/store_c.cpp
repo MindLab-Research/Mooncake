@@ -319,6 +319,15 @@ int64_t mooncake_store_get_size(mooncake_store_t store, const char *key) {
     }
 }
 
+int mooncake_store_durable_delete_status(mooncake_store_t store, const char *key) {
+    if (!store || !key) return -1;
+    try {
+        return as_client(store)->getDurableDeleteStatus(key);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int mooncake_store_get_hostname(mooncake_store_t store, char *buf_out,
                                 size_t buf_len) {
     if (!store || !buf_out || buf_len == 0) return -1;
@@ -349,6 +358,16 @@ int mooncake_store_remove_durable(mooncake_store_t store, const char *key) {
     if (!store || !key) return -1;
     try {
         return as_client(store)->remove_durable(key);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_remove_durable_scoped(mooncake_store_t store, const char *key,
+                                         const char *scope_anchor_key) {
+    if (!store || !key || !scope_anchor_key) return -1;
+    try {
+        return as_client(store)->remove_durable_scoped(key, scope_anchor_key);
     } catch (...) {
         return -1;
     }

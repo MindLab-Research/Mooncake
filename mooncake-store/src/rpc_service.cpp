@@ -99,6 +99,13 @@ WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
+tl::expected<int, ErrorCode> WrappedMasterService::GetDurableDeleteStatus(
+    std::string key, std::string tenant_id) {
+    return WithRequestTenant(tenant_id, [&](const TenantId& tenant) {
+        return master_service_.GetDurableDeleteStatus(key, tenant);
+    });
+}
+
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
@@ -1616,9 +1623,26 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
 WrappedMasterService::RemoveDurable(std::string key, std::string tenant_id) {
+    return RemoveDurableImpl(std::move(key), std::move(tenant_id), {});
+}
+
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+WrappedMasterService::RemoveDurableScoped(std::string key,
+                                          std::string scope_anchor_key,
+                                          std::string tenant_id) {
+    if (scope_anchor_key.empty())
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    co_return co_await RemoveDurableImpl(
+        std::move(key), std::move(tenant_id), std::move(scope_anchor_key));
+}
+
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+WrappedMasterService::RemoveDurableImpl(std::string key, std::string tenant_id,
+                                        std::string scope_anchor_key) {
     auto tenant = ResolveRequestTenantId(tenant_id);
     if (!tenant) co_return tl::make_unexpected(tenant.error());
-    auto plan = master_service_.PrepareDurableDelete(key, *tenant);
+    auto plan =
+        master_service_.PrepareDurableDelete(key, *tenant, scope_anchor_key);
     if (!plan) co_return tl::make_unexpected(plan.error());
     if (plan->completed) co_return tl::expected<void, ErrorCode>{};
     std::vector<
@@ -1846,6 +1870,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&WrappedMasterService::GetDurableDeleteStatus>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
@@ -1932,6 +1958,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
     server.register_handler<&WrappedMasterService::RemoveDurable>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RemoveDurableScoped>(
         &wrapped_master_service);
     server.register_handler<
         &WrappedMasterService::ValidateDurableDeleteAssignment>(

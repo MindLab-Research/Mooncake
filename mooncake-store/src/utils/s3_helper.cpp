@@ -40,6 +40,22 @@
 
 namespace mooncake {
 
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+namespace {
+std::mutex s3_complete_hook_mutex;
+S3BeforeCompleteHook s3_before_complete_hook;
+}  // namespace
+
+void SetS3BeforeCompleteHook(S3BeforeCompleteHook hook) {
+    std::lock_guard lock(s3_complete_hook_mutex);
+    s3_before_complete_hook = std::move(hook);
+}
+
+void ClearS3BeforeCompleteHook() {
+    SetS3BeforeCompleteHook({});
+}
+#endif
+
 namespace {
 
 // Parse a checksum-mode string ("when_supported" | "when_required") into the
@@ -1128,6 +1144,16 @@ tl::expected<void, S3RequestError> S3Helper::UploadSlicesImpl(
     finish.SetKey(key.c_str());
     finish.SetUploadId(upload_id);
     finish.SetMultipartUpload(std::move(completed));
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+    S3BeforeCompleteHook hook;
+    {
+        std::lock_guard lock(s3_complete_hook_mutex);
+        hook = s3_before_complete_hook;
+    }
+    // Invoke outside the hook mutex and before the SDK call: the callback may
+    // perform a concurrent S3 delete/abort without lock inversion.
+    if (hook) hook(key);
+#endif
     auto finished = s3_client_.CompleteMultipartUpload(finish);
     if (!finished.IsSuccess())
         return tl::make_unexpected(ClassifyS3Error(finished.GetError()));

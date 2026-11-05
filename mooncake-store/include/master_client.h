@@ -424,6 +424,10 @@ class MasterClient {
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
     tl::expected<void, ErrorCode> RemoveDurable(const std::string& key);
+    tl::expected<void, ErrorCode> RemoveDurableScoped(
+        const std::string& key, const std::string& scope_anchor_key);
+
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(const std::string& key);
 
     tl::expected<void, ErrorCode> ValidateDurableDeleteAssignment(
         const DurableDeleteCommand& command);

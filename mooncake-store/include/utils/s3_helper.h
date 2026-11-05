@@ -8,6 +8,7 @@
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -36,6 +37,17 @@ struct S3ListedObject {
     std::string key;
     uint64_t size = 0;
 };
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+// Test-only synchronization seam for real S3 multipart smoke tests. The callback
+// runs immediately before CompleteMultipartUpload, with no helper lock held.
+// Callers may hold their own backend locks; do not wait on those in the callback.
+// Process-wide; callbacks may filter by physical key. Clear does not wait for an
+// already running callback: join uploading threads before captured state expires.
+using S3BeforeCompleteHook = std::function<void(const std::string &key)>;
+void SetS3BeforeCompleteHook(S3BeforeCompleteHook hook);
+void ClearS3BeforeCompleteHook();
+#endif
 
 class S3Helper {
    public:

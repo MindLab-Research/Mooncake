@@ -282,6 +282,7 @@ struct MasterClientMetric {
             "RegisterDurableDeleteProvider",
             "ValidateDurableDeleteAssignment",
             "RemoveDurable",
+            "RemoveDurableScoped",
             "OffloadObjectHeartbeat",
             "NotifyOffloadSuccess"};
 

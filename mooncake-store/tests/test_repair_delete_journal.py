@@ -22,7 +22,45 @@ def record(key=b"key", done=False):
     return body + b" " + str(zlib.crc32(body)).encode() + b"\n"
 
 
+
+def scoped_record(key=b"key", done=False, anchor=b"artifact/.mint-publication/intent"):
+    body = (
+        b"v4 74656e616e74 "
+        + key.hex().encode()
+        + b" 6f70 "
+        + (b"1" if done else b"0")
+        + b" 73636f7065 900000 "
+        + anchor.hex().encode()
+    )
+    return body + b" " + str(zlib.crc32(body)).encode() + b"\n"
+
+
 class JournalRepairTest(unittest.TestCase):
+    def test_v4_anchor_survives_replay_and_conflicts_are_rejected(self):
+        line = scoped_record() + scoped_record(done=True)
+        self.assertEqual(repair.parse_record(line.splitlines(keepends=True)[0])[-1],
+                         b"artifact/.mint-publication/intent")
+        self.assertEqual(repair.inspect(self._write_temp(line))["damaged"], [])
+        conflict = scoped_record() + scoped_record(done=True, anchor=b"foreign/intent")
+        self.assertTrue(repair.inspect(self._write_temp(conflict))["damaged"])
+
+    def test_v3_cannot_use_v4_missing_grace_sentinel(self):
+        body = record().rsplit(b" ", 1)[0].replace(b"900000", b"-")
+        line = body + b" " + str(zlib.crc32(body)).encode() + b"\n"
+        with self.assertRaises(ValueError):
+            repair.parse_record(line)
+
+    def test_maximum_v4_record_is_recoverable(self):
+        field = (b"x" * 1024).hex().encode()
+        body = b"v4 " + b" ".join([field, field, field, b"0", field, b"0", field])
+        line = body + b" " + str(zlib.crc32(body)).encode() + b"\n"
+        self.assertEqual(repair.inspect(self._write_temp(line))["damaged"], [])
+
+    def _write_temp(self, data):
+        path = self.root / "scoped-journal"
+        path.write_bytes(data)
+        return path
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

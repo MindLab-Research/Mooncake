@@ -1,4 +1,6 @@
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -46,7 +48,13 @@ static bool IsWriterRaceFixture(const S3ObjectStorageConfig& config) {
 
 static void NativeDeleteTest(const std::string& phase = "roundtrip") {
     auto config = S3ObjectStorageConfig::FromEnvironment();
-    const bool regional = phase != "roundtrip" && phase != "warm-peer";
+    const bool scoped_phase = phase == "scoped";
+#ifndef MOONCAKE_ENABLE_TEST_FAILPOINTS
+    Require(!scoped_phase,
+            "native-scoped-delete requires MOONCAKE_ENABLE_TEST_FAILPOINTS=ON");
+#endif
+    const bool regional =
+        phase != "roundtrip" && phase != "warm-peer" && !scoped_phase;
     const bool persistence_fixture = getenv("CTGG_MINT_PERSISTENCE_TEST");
     const bool crash_phase =
         phase == "crash-lease" || phase == "crash-physical";
@@ -55,11 +63,12 @@ static void NativeDeleteTest(const std::string& phase = "roundtrip") {
     const bool writer_phase = phase == "writer-busy" || phase == "writer-ready";
     Require(phase == "roundtrip" || phase == "delete" || phase == "cold" ||
                 phase == "observe" || crash_phase || resume_phase ||
-                writer_phase || phase == "warm-peer",
+                writer_phase || phase == "warm-peer" || scoped_phase,
             "native delete phase");
     Require(
         config.endpoint.starts_with("http://127.0.0.1:") ||
-            (regional && config.endpoint.starts_with("https://") &&
+            ((regional || scoped_phase) &&
+             config.endpoint.starts_with("https://") &&
              config.endpoint.ends_with(".aliyuncs.com") &&
              config.key_prefix.starts_with("ctgg-native-oss-delete-20260914/")),
         "native deletion needs loopback or an isolated OSS fixture prefix");
@@ -115,7 +124,7 @@ static void NativeDeleteTest(const std::string& phase = "roundtrip") {
                 "transport fault fixture must be loaded");
     const int first = phase == "cold" || phase == "observe" ? 1 : 0;
     const int end = phase == "delete" || crash_phase || resume_phase ||
-                            writer_phase || phase == "warm-peer"
+                            writer_phase || phase == "warm-peer" || scoped_phase
                         ? 1
                         : 2;
     for (int cold = first; cold < end; ++cold) {
@@ -130,7 +139,10 @@ static void NativeDeleteTest(const std::string& phase = "roundtrip") {
         }
         WrappedMasterServiceConfig master_config;
         master_config.default_kv_lease_ttl =
-            regional || phase == "warm-peer" || persistence_fixture ? 5000 : 0;
+            !scoped_phase &&
+                    (regional || phase == "warm-peer" || persistence_fixture)
+                ? 5000
+                : 0;
         master_config.enable_offload = true;
         master_config.enable_metric_reporting = false;
         master_config.root_fs_dir = directory;
@@ -213,6 +225,201 @@ static void NativeDeleteTest(const std::string& phase = "roundtrip") {
             if (rc != 0) return tl::make_unexpected(static_cast<ErrorCode>(rc));
             return {};
         };
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+        if (scoped_phase) {
+            const std::string base = "artifact-" + UuidToString(generate_uuid());
+            const auto anchor = base + "/.mint-publication/intent";
+            const auto existing = base + "/existing";
+            const auto unknown = base + "/unknown-master";
+            const auto absent = base + "/never-created";
+            const auto race = base + "/multipart";
+            const auto outside = base + "-sibling/object";
+            const std::vector<char> bytes(4096, 's');
+            for (const auto& key : {anchor, existing, unknown, absent, race, outside}) {
+                Require(TenantId::Default().MakeScopedKey(key).size() <= 128,
+                        "fixture stays within provider scoped-key limit");
+                Require(mooncake_store_durable_delete_status(
+                            c_client.handle, key.c_str()) == 0,
+                        "read-only journal status is unknown before admission");
+            }
+            auto scoped_remove = [&](const std::string& key) {
+                return mooncake_store_remove_durable_scoped(
+                    c_client.handle, key.c_str(), anchor.c_str());
+            };
+            auto require_physical = [&](const std::string& key, bool present) {
+                auto raw = physical.ObjectExists(physical_key(key));
+                Require(raw && *raw == present,
+                        "physical S3 HEAD " + key + " present=" +
+                            std::to_string(present));
+            };
+            for (const auto& key : {anchor, existing}) {
+                Require(provider->put(key, bytes) == 0,
+                        "native scoped fixture Put");
+                bool durable = false;
+                for (int attempt = 0; attempt < 100; ++attempt) {
+                    auto query = provider->batch_query({key});
+                    if (query.size() == 1 && query[0])
+                        for (const auto& replica : query[0]->replicas)
+                            durable |= replica.is_local_disk_replica() &&
+                                       replica.status == ReplicaStatus::COMPLETE;
+                    if (durable) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                Require(durable,
+                        "scoped fixture reaches native durable provider");
+                require_physical(key, true);
+            }
+            Require(master.GetReplicaListForAdmin(existing).has_value(),
+                    "existing target has Master metadata");
+            Require(inspector.Put(TenantId::Default().MakeScopedKey(unknown), bytes)
+                        .has_value(),
+                    "real S3 orphan fixture Put without Master metadata");
+            Require(inspector.Put(TenantId::Default().MakeScopedKey(outside), bytes)
+                        .has_value(),
+                    "real S3 out-of-prefix control");
+            require_physical(unknown, true);
+            auto unknown_metadata = master.GetReplicaListForAdmin(unknown);
+            Require(!unknown_metadata &&
+                        unknown_metadata.error() == ErrorCode::OBJECT_NOT_FOUND,
+                    "unknown target is genuinely absent from Master metadata");
+            require_physical(absent, false);
+            Require(scoped_remove(outside) ==
+                        static_cast<int>(ErrorCode::INVALID_PARAMS),
+                    "prefix sibling is rejected, not treated as a descendant");
+            Require(mooncake_store_remove_durable_scoped(
+                        c_client.handle, unknown.c_str(),
+                        (base + "/not-an-intent").c_str()) ==
+                        static_cast<int>(ErrorCode::INVALID_PARAMS),
+                    "malformed scope anchor is rejected");
+            require_physical(outside, true);
+            require_physical(unknown, true);
+            for (const auto& key : {existing, unknown, absent}) {
+                if (key == unknown) {
+                    auto metadata = master.GetReplicaListForAdmin(key);
+                    Require(!metadata && metadata.error() ==
+                                             ErrorCode::OBJECT_NOT_FOUND,
+                            "orphan is still unknown immediately before delete");
+                    require_physical(key, true);
+                }
+                Require(scoped_remove(key) == 0, "scoped C ABI deletes " + key);
+                require_physical(key, false);
+                Require(mooncake_store_durable_delete_status(
+                            c_client.handle, key.c_str()) == 2,
+                        "scoped delete has completed journal status");
+                Require(scoped_remove(key) == 0, "scoped cleanup is idempotent");
+                require_physical(anchor, true);
+            }
+            std::cout << "NATIVE_SCOPED_UNKNOWN_METADATA_PASS" << std::endl;
+
+            // Use the real durable admission protocol and SDK uploader, as in
+            // MultipartAdmissionTest. Do not use adapter.Put here: its post-
+            // Complete cleanup could hide a transient resurrection. The helper
+            // exposes the actual Complete response and never deletes data bytes.
+            const auto scoped_race = TenantId::Default().MakeScopedKey(race);
+            const auto object = physical_key(race);
+            const auto marker = config.key_prefix + "/writers/" +
+                                Hash(std::vector<char>(scoped_race.begin(),
+                                                       scoped_race.end())) +
+                                "/held-complete";
+            auto upload_id = physical.CreateUpload(object);
+            Require(upload_id.has_value(), "create real S3 multipart upload");
+            const auto admission =
+                std::string("mooncake-multipart-admission-v2\n") + *upload_id;
+            Require(physical.UploadBytes(marker, std::span<const char>(admission))
+                        .has_value(),
+                    "persist real multipart intent before any parts");
+            // Two successfully uploaded parts (32 MiB plus a short tail).
+            const std::vector<char> multipart((32UL << 20) + 13, 'm');
+            std::mutex mutex;
+            std::condition_variable changed;
+            bool reached = false, release = false;
+            SetS3BeforeCompleteHook([&](const std::string& key) {
+                if (key != object) return;
+                std::unique_lock lock(mutex);
+                reached = true;
+                changed.notify_all();
+                changed.wait(lock, [&] { return release; });
+            });
+            tl::expected<void, S3RequestError> uploaded;
+            std::thread writer([&] {
+                uploaded = physical.UploadAdmittedSlices(
+                    object, *upload_id, {std::span<const char>(multipart)});
+            });
+            struct ReleaseWriter {
+                std::mutex& mutex;
+                std::condition_variable& changed;
+                bool& release;
+                std::thread& writer;
+                ~ReleaseWriter() {
+                    {
+                        std::lock_guard lock(mutex);
+                        release = true;
+                    }
+                    changed.notify_all();
+                    writer.join();
+                    ClearS3BeforeCompleteHook();
+                }
+            };
+            {
+                ReleaseWriter cleanup{mutex, changed, release, writer};
+                {
+                    std::unique_lock lock(mutex);
+                    Require(changed.wait_for(lock, std::chrono::seconds(60),
+                                             [&] { return reached; }),
+                            "all real S3 parts uploaded; Complete is held");
+                }
+                auto intent = physical.ObjectExists(marker);
+                Require(intent && *intent, "admission still exists at failpoint");
+                require_physical(race, false);
+                auto metadata = master.GetReplicaListForAdmin(race);
+                Require(!metadata && metadata.error() == ErrorCode::OBJECT_NOT_FOUND,
+                        "held multipart has no Master metadata");
+                // This must return while Complete is held. No backend key mutex
+                // is held by the direct helper writer, and the hook registry
+                // mutex was released before invoking our blocking callback.
+                Require(scoped_remove(race) == 0,
+                        "native scoped delete fences and aborts held upload");
+                intent = physical.ObjectExists(marker);
+                Require(intent && !*intent, "provider revoked upload admission");
+                auto fence = inspector.HasDeletionIntent(scoped_race);
+                Require(fence && *fence, "provider persisted permanent S3 fence");
+                require_physical(race, false);
+                require_physical(anchor, true);
+            }  // Release the held SDK Complete, then join before inspecting it.
+            Require(!uploaded && uploaded.error().http_status == 404 &&
+                        uploaded.error().message.find("NoSuchUpload") !=
+                            std::string::npos,
+                    "released real Complete fails with server NoSuchUpload");
+            require_physical(race, false);
+            Require(mooncake_store_durable_delete_status(
+                        c_client.handle, race.c_str()) == 2,
+                    "held multipart delete has completed journal status");
+            std::cout << "NATIVE_SCOPED_HELD_COMPLETE_NO_RESURRECTION_PASS "
+                      << uploaded.error().message << std::endl;
+            for (const auto& key : {existing, unknown, absent, race}) {
+                Require(scoped_remove(key) == 0,
+                        "repeat complete cleanup before removing anchor");
+                require_physical(key, false);
+            }
+            require_physical(anchor, true);
+            Require(scoped_remove(anchor) == 0, "publication anchor deleted last");
+            require_physical(anchor, false);
+            for (const auto& key : {existing, unknown, absent, race, anchor}) {
+                Require(scoped_remove(key) == 0,
+                        "completed scoped cleanup survives deleted anchor");
+                Require(mooncake_store_durable_delete_status(
+                            c_client.handle, key.c_str()) == 2,
+                        "completed journal status survives deleted anchor");
+            }
+            require_physical(outside, true);
+            Require(inspector.Delete(TenantId::Default().MakeScopedKey(outside))
+                        .has_value(),
+                    "remove isolated out-of-prefix control");
+            std::cout << "NATIVE_SCOPED_DELETE_PASS" << std::endl;
+            provider.reset();
+            continue;
+        }
+#endif
         if (phase == "warm-peer") {
             for (const auto& key : {"race", "independent"}) {
                 Require(provider->put(key, std::vector<char>(4096, 'w')) == 0,
@@ -755,6 +962,10 @@ int main(int argc, char** argv) {
         if (mode == "native-delete-oss") {
             Require(argc == 3, "native-delete-oss delete|cold|observe");
             NativeDeleteTest(argv[2]);
+            return 0;
+        }
+        if (mode == "native-scoped-delete") {
+            NativeDeleteTest("scoped");
             return 0;
         }
         if (mode == "native-delete") {

@@ -67,6 +67,22 @@
 namespace mooncake {
 
 namespace {
+std::optional<std::string> DurableDeleteScopeParent(
+    const std::string& anchor, const std::string& target) {
+    constexpr std::string_view kAnchorSuffix =
+        "/.mint-publication/intent";
+    if (anchor.size() <= kAnchorSuffix.size() ||
+        !anchor.ends_with(kAnchorSuffix))
+        return std::nullopt;
+    const auto parent = anchor.substr(0, anchor.size() - kAnchorSuffix.size());
+    if (parent.empty() ||
+        (target != parent &&
+         (target.size() <= parent.size() ||
+          target.compare(0, parent.size(), parent) != 0 ||
+          target[parent.size()] != '/')))
+        return std::nullopt;
+    return parent;
+}
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
 
@@ -6678,10 +6694,13 @@ void MasterService::RecoverDurableDeletions() {
             throw std::runtime_error(
                 "Snapshot conflicts with deletion journal");
         }
-        state.durable_deletions[record.key] = {operation, record.completed,
-                                               record.namespace_identity};
+        state.durable_deletions[record.key] =
+            TenantState::DurableDeleteState{
+                operation, record.completed, record.namespace_identity, {},
+                record.reader_grace_ms, record.scope_anchor_key};
         auto& restored = state.durable_deletions.at(record.key);
         restored.reader_grace_ms = record.reader_grace_ms;
+        restored.scope_anchor_key = record.scope_anchor_key;
         if (record.reader_grace_ms && !record.completed)
             restored.recovery_not_before =
                 std::chrono::steady_clock::now() +
@@ -6780,8 +6799,22 @@ tl::expected<void, ErrorCode> MasterService::RegisterDurableDeleteProvider(
     return {};
 }
 
-tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
+tl::expected<int, ErrorCode> MasterService::GetDurableDeleteStatus(
     const std::string& key, const TenantId& tenant_id) {
+    if (key.empty() || !tenant_id.IsValid())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (enable_ha_ || !durable_delete_journal_)
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    const auto record = durable_delete_journal_->Lookup(
+        object_id.tenant_id.value(), object_id.user_key);
+    if (!record) return 0;
+    return record->completed ? 2 : 1;
+}
+
+tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
+    const std::string& key, const TenantId& tenant_id,
+    const std::string& scope_anchor_key) {
     if (key.empty() || !tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -6792,21 +6825,89 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    [[maybe_unused]] auto operation_lock =
-        AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
+    const bool scoped = !scope_anchor_key.empty();
+    if (scoped && !DurableDeleteScopeParent(scope_anchor_key, key))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    ObjectOperationLock operation_lock;
+    std::optional<ObjectOperationLock> anchor_operation_lock;
+    if (!scoped) {
+        operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+    } else {
+        const auto target_scoped = object_id.tenant_id.MakeScopedKey(key);
+        const auto anchor_scoped =
+            object_id.tenant_id.MakeScopedKey(scope_anchor_key);
+        const auto target_stripe =
+            std::hash<std::string>{}(target_scoped) % kObjectOperationLockStripes;
+        const auto anchor_stripe =
+            std::hash<std::string>{}(anchor_scoped) % kObjectOperationLockStripes;
+        if (target_stripe == anchor_stripe) {
+            operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+        } else if (target_stripe < anchor_stripe) {
+            operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+            anchor_operation_lock.emplace(AcquireObjectOperationLock(
+                object_id.tenant_id, scope_anchor_key));
+        } else {
+            anchor_operation_lock.emplace(AcquireObjectOperationLock(
+                object_id.tenant_id, scope_anchor_key));
+            operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+        }
+    }
     std::shared_lock snapshot_lock(snapshot_mutex_);
+    std::string scoped_namespace;
+    if (scoped) {
+        MetadataAccessorRO anchor_accessor(
+            this, MakeObjectIdentityForRequest(scope_anchor_key, tenant_id));
+        if (anchor_accessor.Exists()) {
+            const auto& anchor_metadata = anchor_accessor.Get();
+            if (!anchor_metadata.AllReplicas(&Replica::fn_is_completed) ||
+                !anchor_metadata.HasReplica(&Replica::fn_is_local_disk_replica))
+                return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+            std::lock_guard provider_lock(durable_provider_mutex_);
+            for (const auto& replica : anchor_metadata.GetAllReplicas()) {
+                const auto owner = replica.get_local_disk_client_id();
+                if (!owner) continue;
+                const auto provider = durable_providers_.find(*owner);
+                if (provider == durable_providers_.end() ||
+                    !local_ssd_manager_.GetUsage(*owner) ||
+                    provider->second.protocol_version !=
+                        kDurableReadFenceProtocolVersion)
+                    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+                const auto identity = provider->second.Identity();
+                if (!scoped_namespace.empty() && scoped_namespace != identity)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                scoped_namespace = identity;
+            }
+        } else {
+            const auto* anchor_state = anchor_accessor.GetTenantState();
+            if (!anchor_state)
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            const auto anchor_delete =
+                anchor_state->durable_deletions.find(scope_anchor_key);
+            if (anchor_delete == anchor_state->durable_deletions.end() ||
+                (!anchor_delete->second.completed && key != scope_anchor_key) ||
+                anchor_delete->second.scope_anchor_key != scope_anchor_key)
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            scoped_namespace = anchor_delete->second.namespace_identity;
+        }
+        if (scoped_namespace.empty())
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     MetadataAccessorRW accessor(this, object_id);
     if (accessor.IsDurableDeleteFenced()) {
         const auto& state = accessor.GetTenantState().durable_deletions.at(key);
+        if (state.scope_anchor_key != scope_anchor_key ||
+            (scoped && state.namespace_identity != scoped_namespace))
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         if (state.completed) return state.operation_id;
-        if (state.reader_grace_ms) {
+        if (state.reader_grace_ms || scoped) {
             // Reconfirm durability after an uncertain first append. The
             // original admission already excluded writers and offload tasks;
             // the permanent fence rejects new work and delayed discovery.
             if (!durable_delete_journal_->Commit(
                     {object_id.tenant_id.value(), key,
                      UuidToString(state.operation_id), false,
-                     state.namespace_identity, state.reader_grace_ms}))
+                     state.namespace_identity, state.reader_grace_ms,
+                     state.scope_anchor_key}))
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             if (std::chrono::steady_clock::now() < state.recovery_not_before ||
@@ -6838,30 +6939,44 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
             return state.operation_id;
         }
     }
-    if (!accessor.Exists()) {
-        // A missing key still requires a provider route and persistent intent
-        // lookup. Never convert this into a successful durable deletion.
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
-    if (!metadata.AllReplicas(&Replica::fn_is_completed) ||
-        accessor.InProcessing()) {
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-    }
-    if (accessor.HasReplicationTask() ||
-        tenant_state.offloading_tasks.contains(key) ||
-        tenant_state.promotion_tasks.contains(key) ||
-        tenant_state.dynamic_replication_pending.contains(key) ||
-        metadata.HasReplica(
-            [](const Replica& replica) { return replica.is_busy(); })) {
-        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-    }
-    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
-        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-    }
     std::string namespace_identity;
-    {
+    if (scoped) {
+        namespace_identity = scoped_namespace;
+        if (object_id.tenant_id.MakeScopedKey(key).size() > 1024)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        if (accessor.Exists()) {
+            const auto& metadata = accessor.Get();
+            std::lock_guard provider_lock(durable_provider_mutex_);
+            if (metadata.RemainingReadLeaseMs() != 0)
+                return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                const auto owner = replica.get_local_disk_client_id();
+                if (!owner) continue;
+                const auto provider = durable_providers_.find(*owner);
+                if (provider == durable_providers_.end() ||
+                    provider->second.Identity() != namespace_identity ||
+                    provider->second.protocol_version !=
+                        kDurableReadFenceProtocolVersion)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+    } else {
+        if (!accessor.Exists())
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        auto& metadata = accessor.Get();
+        if (!metadata.AllReplicas(&Replica::fn_is_completed) ||
+            accessor.InProcessing())
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        if (accessor.HasReplicationTask() ||
+            tenant_state.offloading_tasks.contains(key) ||
+            tenant_state.promotion_tasks.contains(key) ||
+            tenant_state.dynamic_replication_pending.contains(key) ||
+            metadata.HasReplica(
+                [](const Replica& replica) { return replica.is_busy(); }))
+            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica))
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
         std::lock_guard provider_lock(durable_provider_mutex_);
         for (const auto& replica : metadata.GetAllReplicas()) {
             const auto owner = replica.get_local_disk_client_id();
@@ -6870,13 +6985,11 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
             if (provider == durable_providers_.end() ||
                 !local_ssd_manager_.GetUsage(*owner) ||
                 provider->second.protocol_version !=
-                    kDurableReadFenceProtocolVersion) {
+                    kDurableReadFenceProtocolVersion)
                 return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-            }
             if (object_id.tenant_id.MakeScopedKey(key).size() >
-                provider->second.max_scoped_key_bytes) {
+                provider->second.max_scoped_key_bytes)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
             const auto identity = provider->second.Identity();
             if (!namespace_identity.empty() && namespace_identity != identity)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -6884,52 +6997,101 @@ tl::expected<UUID, ErrorCode> MasterService::BeginDurableDelete(
         }
     }
     auto found = tenant_state.durable_deletions.find(key);
-    if (found == tenant_state.durable_deletions.end()) {
-        found = tenant_state.durable_deletions
-                    .emplace(
-                        key,
-                        TenantState::DurableDeleteState{
-                            .operation_id = generate_uuid(),
-                            .namespace_identity = namespace_identity,
-                            .reader_grace_ms = metadata.RemainingReadLeaseMs()})
-                    .first;
-    }
-    if (found->second.namespace_identity != namespace_identity)
+    if (found != tenant_state.durable_deletions.end())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    // A failed/uncertain append still fences this running process. Never allow
-    // provider deletion until retry confirms that the fence is durable.
-    const auto previous_media = KvMediaSnapshot(metadata);
-    metadata.durable_delete_pending = true;
-    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_media);
+    const auto grace_ms =
+        accessor.Exists() ? std::optional<uint64_t>
+                                (accessor.Get().RemainingReadLeaseMs())
+                          : std::nullopt;
+    TenantState::DurableDeleteState state;
+    state.operation_id = generate_uuid();
+    state.namespace_identity = namespace_identity;
+    state.reader_grace_ms = grace_ms;
+    state.scope_anchor_key = scope_anchor_key;
+    found = tenant_state.durable_deletions.emplace(key, std::move(state)).first;
+    if (accessor.Exists()) {
+        auto& metadata = accessor.Get();
+        const auto previous_media = KvMediaSnapshot(metadata);
+        metadata.durable_delete_pending = true;
+        SyncKvObjectState(key, metadata, object_id.tenant_id, previous_media);
+        if (accessor.InProcessing()) {
+            auto processing = PopReplicasWithCacheTotalAccounting(
+                metadata, &Replica::fn_is_processing);
+            metadata.ClearPendingSoftPinAction();
+            if (!processing.empty()) {
+                FreeDfsReplicas(key, processing);
+                std::lock_guard lock(discarded_replicas_mutex_);
+                discarded_replicas_.emplace_back(
+                    std::move(processing), std::chrono::system_clock::now() +
+                                             put_start_release_timeout_sec_);
+            }
+            accessor.EraseFromProcessing();
+        }
+        auto& live_state = accessor.GetTenantState();
+        if (live_state.offloading_tasks.contains(key) &&
+            CancelQueuedOffloadTask(live_state, metadata, object_id))
+            local_ssd_manager_.RemoveOffloadFromAll(object_id.tenant_id, key);
+        live_state.promotion_tasks.erase(key);
+        live_state.promotion_candidates.erase(key);
+        ClearDynamicReplicationStateForKey(live_state, key);
+        // A cancelled PutStart may leave zero replicas. Erase its metadata and
+        // quota reservation; the retained deletion record owns the fence now.
+        if (!metadata.IsValid()) accessor.Erase();
+    }
     if (!durable_delete_journal_->Commit(
             {object_id.tenant_id.value(), key,
              UuidToString(found->second.operation_id), false,
-             found->second.namespace_identity,
-             found->second.reader_grace_ms})) {
+             found->second.namespace_identity, grace_ms, scope_anchor_key}))
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
-    // Stop lease renewal first; existing readers may finish while callers
-    // retry. No metadata lock is retained across a provider RPC or a wait.
-    if (!metadata.IsLeaseExpired()) {
+    if (accessor.Exists() && !scoped &&
+        !accessor.Get().AllReplicas(&Replica::fn_is_completed))
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    if (accessor.Exists() && !accessor.Get().IsLeaseExpired())
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
-    }
     return found->second.operation_id;
 }
 
 tl::expected<DurableDeletePlan, ErrorCode> MasterService::PrepareDurableDelete(
-    const std::string& key, const TenantId& tenant) {
-    auto begun = BeginDurableDelete(key, tenant);
+    const std::string& key, const TenantId& tenant,
+    const std::string& scope_anchor_key) {
+    auto begun = BeginDurableDelete(key, tenant, scope_anchor_key);
     if (!begun) return tl::make_unexpected(begun.error());
     const auto object_id = MakeObjectIdentityForRequest(key, tenant);
-    auto operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+    ObjectOperationLock operation_lock;
+    std::optional<ObjectOperationLock> anchor_operation_lock;
+    if (!scope_anchor_key.empty()) {
+        const auto target_scoped = object_id.tenant_id.MakeScopedKey(key);
+        const auto anchor_scoped =
+            object_id.tenant_id.MakeScopedKey(scope_anchor_key);
+        const auto target_stripe =
+            std::hash<std::string>{}(target_scoped) % kObjectOperationLockStripes;
+        const auto anchor_stripe =
+            std::hash<std::string>{}(anchor_scoped) % kObjectOperationLockStripes;
+        if (target_stripe == anchor_stripe) {
+            operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+        } else if (target_stripe < anchor_stripe) {
+            operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+            anchor_operation_lock.emplace(AcquireObjectOperationLock(
+                object_id.tenant_id, scope_anchor_key));
+        } else {
+            anchor_operation_lock.emplace(AcquireObjectOperationLock(
+                object_id.tenant_id, scope_anchor_key));
+            operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+        }
+    } else {
+        operation_lock = AcquireObjectOperationLock(object_id.tenant_id, key);
+    }
     std::shared_lock snapshot_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.IsDurableDeleteFenced())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     auto& state = accessor.GetTenantState().durable_deletions.at(key);
     DurableDeletePlan plan{state.operation_id, state.completed, {}};
+    if (state.scope_anchor_key != scope_anchor_key)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     if (state.completed) return plan;
-    if ((!accessor.Exists() && !state.reader_grace_ms) ||
+    if ((!accessor.Exists() && !state.reader_grace_ms &&
+         state.scope_anchor_key.empty()) ||
         std::chrono::steady_clock::now() < state.recovery_not_before ||
         (accessor.Exists() && !accessor.Get().IsLeaseExpired()))
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -6981,7 +7143,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateDurableDeleteAssignment(
         assignment == state.assignments.end() ||
         assignment->second != command.assignment_id)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    if ((!accessor.Exists() && !state.reader_grace_ms) ||
+    if ((!accessor.Exists() && !state.reader_grace_ms &&
+         state.scope_anchor_key.empty()) ||
         std::chrono::steady_clock::now() < state.recovery_not_before ||
         (accessor.Exists() && !accessor.Get().IsLeaseExpired()))
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
@@ -7020,14 +7183,15 @@ tl::expected<void, ErrorCode> MasterService::FinishDurableDelete(
         // Preserve both metadata and the fence for an idempotent retry.
         return tl::make_unexpected(provider_result);
     }
-    if (!accessor.Exists() && !state.reader_grace_ms) {
+    if (!accessor.Exists() && !state.reader_grace_ms &&
+        state.scope_anchor_key.empty()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     if (std::chrono::steady_clock::now() < state.recovery_not_before ||
         (accessor.Exists() && !accessor.Get().IsLeaseExpired())) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
-    if (accessor.Exists() &&
+    if (accessor.Exists() && state.scope_anchor_key.empty() &&
         (!accessor.Get().AllReplicas(&Replica::fn_is_completed) ||
          accessor.Get().HasReplica(
              [](const Replica& replica) { return replica.is_busy(); }))) {
@@ -7066,7 +7230,8 @@ tl::expected<void, ErrorCode> MasterService::FinishDurableDelete(
     if (!durable_delete_journal_ ||
         !durable_delete_journal_->Commit(
             {object_id.tenant_id.value(), key, UuidToString(operation_id), true,
-             state.namespace_identity, state.reader_grace_ms})) {
+             state.namespace_identity, state.reader_grace_ms,
+             state.scope_anchor_key})) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     state.completed = true;
@@ -12728,7 +12893,8 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 !state.durable_deletions
                      .emplace(key,
                               TenantState::DurableDeleteState{
-                                  operation_id, completed, namespace_identity})
+                                  operation_id, completed, namespace_identity, {},
+                                  std::nullopt, {}})
                      .second) {
                 return tl::make_unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,

@@ -193,6 +193,7 @@ shims! {
         results_out: *mut c_int,
     ) -> c_int;
     fn mooncake_store_get_size(store: mooncake_store_t, key: *const c_char) -> i64;
+    fn mooncake_store_durable_delete_status(store: mooncake_store_t, key: *const c_char) -> c_int;
     fn mooncake_store_get_hostname(
         store: mooncake_store_t,
         buf_out: *mut c_char,

@@ -3504,9 +3504,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
+tl::expected<int, ErrorCode> Client::GetDurableDeleteStatus(
+    const std::string& key) {
+    return master_client_.GetDurableDeleteStatus(key);
+}
+
 tl::expected<void, ErrorCode> Client::RemoveDurable(const ObjectKey& key) {
     if (hot_cache_) hot_cache_->BumpKeyGeneration(key);
     auto result = master_client_.RemoveDurable(key);
+    if (!result) return tl::unexpected(result.error());
+    if (hot_cache_) hot_cache_->RemoveHotKey(key);
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::RemoveDurableScoped(
+    const ObjectKey& key, const ObjectKey& scope_anchor_key) {
+    if (hot_cache_) hot_cache_->BumpKeyGeneration(key);
+    auto result = master_client_.RemoveDurableScoped(key, scope_anchor_key);
     if (!result) return tl::unexpected(result.error());
     if (hot_cache_) hot_cache_->RemoveHotKey(key);
     return {};

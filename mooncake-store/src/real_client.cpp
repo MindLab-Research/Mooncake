@@ -2291,6 +2291,12 @@ int RealClient::remove_durable(const std::string &key) {
     return to_py_ret(client_->RemoveDurable(key));
 }
 
+int RealClient::remove_durable_scoped(const std::string &key,
+                                      const std::string &scope_anchor_key) {
+    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->RemoveDurableScoped(key, scope_anchor_key));
+}
+
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
     const std::string &str, bool force) {
     if (!client_) {
@@ -2409,6 +2415,19 @@ tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
 
 int64_t RealClient::getSize(const std::string &key) {
     return to_py_ret(getSize_internal(key));
+}
+
+tl::expected<int, ErrorCode> RealClient::getDurableDeleteStatus_internal(
+    const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->GetDurableDeleteStatus(key);
+}
+
+int RealClient::getDurableDeleteStatus(const std::string &key) {
+    return to_py_ret(getDurableDeleteStatus_internal(key));
 }
 
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(

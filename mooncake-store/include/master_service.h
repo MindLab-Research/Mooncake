@@ -990,6 +990,10 @@ class MasterService {
      */
     void setHttpMetadataServer(HttpMetadataServer* server);
 
+    // Canonical journal only: 0 unknown, 1 pending, 2 durably completed.
+    tl::expected<int, ErrorCode> GetDurableDeleteStatus(
+        const std::string& key, const TenantId& tenant_id);
+
     /**
      * @brief Configure cleanup against a separately-deployed HTTP metadata
      * server (not co-located in the master process). The master sends HTTP
@@ -1005,7 +1009,8 @@ class MasterService {
     std::unique_ptr<DurableDeleteJournal> durable_delete_journal_;
     void RecoverDurableDeletions();
     tl::expected<DurableDeletePlan, ErrorCode> PrepareDurableDelete(
-        const std::string& key, const TenantId& tenant);
+        const std::string& key, const TenantId& tenant,
+        const std::string& scope_anchor_key = {});
     // Registry is volatile: providers must re-register after Master restart.
     // Lock order: snapshot -> metadata shard (if any) -> provider registry.
     std::mutex durable_provider_mutex_;
@@ -1015,8 +1020,9 @@ class MasterService {
     // Internal coordinator stages. Do not expose through RPC until durable
     // recovery and authenticated provider confirmation are wired in. In HA
     // mode admission refuses to create an unlogged deletion fence.
-    tl::expected<UUID, ErrorCode> BeginDurableDelete(const std::string& key,
-                                                     const TenantId& tenant_id);
+    tl::expected<UUID, ErrorCode> BeginDurableDelete(
+        const std::string& key, const TenantId& tenant_id,
+        const std::string& scope_anchor_key = {});
     tl::expected<void, ErrorCode> FinishDurableDelete(
         const std::string& key, const TenantId& tenant_id,
         const UUID& operation_id, ErrorCode provider_result,
@@ -1737,6 +1743,8 @@ class MasterService {
             // Canonical journal restores these; snapshots need not serialize
             // a monotonic-clock deadline or infer grace from missing metadata.
             std::optional<uint64_t> reader_grace_ms;
+            // Restored from the canonical deletion journal, not snapshots.
+            std::string scope_anchor_key;
             std::chrono::steady_clock::time_point recovery_not_before{};
         };
         // Retained after metadata removal: absence is not deletion success,
