@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <unordered_set>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -384,12 +385,24 @@ S3ObjectStorageAdapter::ListKeys() {
     if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     auto result = helper_->ListObjectsV2Detailed(PhysicalPrefix());
     if (!result) return tl::make_unexpected(MapError(result.error()));
+    // List intents only after objects, so an intent written while objects were
+    // listed is still seen. One listing replaces a HEAD per object, which made
+    // the periodic refresh hold the lifecycle lock for O(objects) round trips.
+    const auto intent_prefix = config_.key_prefix + "/deletions/";
+    auto intents = helper_->ListObjectsV2Detailed(intent_prefix);
+    if (!intents) return tl::make_unexpected(MapError(intents.error()));
+    std::unordered_set<std::string> deleted;
+    deleted.reserve(intents->size());
+    for (const auto& intent : *intents) {
+        if (intent.key.starts_with(intent_prefix))
+            deleted.insert(intent.key.substr(intent_prefix.size()));
+    }
     std::vector<KeyInfo> keys;
     const auto prefix = PhysicalPrefix();
     for (const auto& object : *result) {
         if (!object.key.starts_with(prefix)) continue;
         auto encoded = object.key.substr(prefix.size());
-        if (encoded.size() % 2) continue;
+        if (encoded.size() % 2 || deleted.contains(encoded)) continue;
         std::string key;
         bool valid = true;
         for (size_t i = 0; i < encoded.size(); i += 2) {
@@ -400,12 +413,8 @@ S3ObjectStorageAdapter::ListKeys() {
             }
             key += static_cast<char>((hi << 4) | lo);
         }
-        if (valid) {
-            auto deleted = HasDeletionIntent(key);
-            if (!deleted) return tl::make_unexpected(deleted.error());
-            if (*deleted) continue;
+        if (valid)
             keys.push_back({std::move(key), static_cast<size_t>(object.size)});
-        }
     }
     return keys;
 }

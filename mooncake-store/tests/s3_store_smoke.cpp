@@ -1,4 +1,5 @@
 #include <chrono>
+#include <set>
 #include <condition_variable>
 #include <mutex>
 #include <iomanip>
@@ -1030,6 +1031,57 @@ int main(int argc, char** argv) {
         }
         if (mode == "multipart-admission") {
             MultipartAdmissionTest();
+            return 0;
+        }
+        if (mode == "list-filters-intents") {
+            auto config = S3ObjectStorageConfig::FromEnvironment();
+            Require(config.endpoint.starts_with("http://127.0.0.1:"),
+                    "list intent suite is loopback-only");
+            S3ObjectStorageAdapter adapter(config);
+            Require(adapter.Init().has_value(), "list intent adapter init");
+            const std::vector<char> payload(64, 'l');
+            std::vector<std::string> keys;
+            // 1100 keys force both listings past one 1000-key page.
+            for (int i = 0; i < 1100; ++i)
+                keys.push_back("tenant/k" + std::to_string(i));
+            keys.push_back(std::string("tenant\0opaque", 13));
+            for (const auto& key : keys)
+                Require(adapter.Put(key, payload).has_value(), "list Put");
+            std::set<std::string> deleted;
+            // k1 is a prefix of k10..k19 and k100..k199: only k1 may vanish.
+            for (const auto& key : keys) {
+                if (key == "tenant/k1" || key.ends_with("7") ||
+                    key == std::string("tenant\0opaque", 13))
+                    deleted.insert(key);
+            }
+            for (const auto& key : deleted)
+                Require(adapter.MarkDeletion(key).has_value(), "list mark");
+            // An intent without bytes must not create a phantom object.
+            Require(adapter.MarkDeletion("tenant/never-written").has_value(),
+                    "orphan intent");
+            auto listed = adapter.ListKeys();
+            Require(listed.has_value(), "ListKeys with intents");
+            std::set<std::string> visible;
+            for (const auto& info : *listed) {
+                Require(info.size == payload.size(), "listed size");
+                Require(visible.insert(info.logical_key).second,
+                        "listed key unique");
+            }
+            for (const auto& key : keys) {
+                auto intent = adapter.HasDeletionIntent(key);
+                Require(intent.has_value(), "HasDeletionIntent");
+                Require(*intent == deleted.contains(key), "intent placement");
+                Require(visible.contains(key) == !*intent,
+                        "ListKeys agrees with HasDeletionIntent");
+            }
+            Require(visible.size() == keys.size() - deleted.size(),
+                    "only intended keys hidden");
+            Require(!visible.contains("tenant/never-written"),
+                    "orphan intent hidden");
+            std::cout << "{\"mode\":\"list-filters-intents\",\"result\":"
+                         "\"PASS\",\"objects\":"
+                      << keys.size() << ",\"intents\":" << deleted.size() + 1
+                      << ",\"visible\":" << visible.size() << "}" << std::endl;
             return 0;
         }
         if (mode == "deletion-intent") {
